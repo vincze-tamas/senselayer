@@ -5,6 +5,8 @@ from sim import Muse2Simulator, load_config
 
 st.set_page_config(page_title="BCI Simulator", page_icon="🧠", layout="wide")
 
+st.autorefresh(interval=1500, key="bci_sim_refresh")
+
 LABELS = {
     "delta": "Delta",
     "theta": "Theta",
@@ -20,7 +22,7 @@ def band_norms(summary):
     return dict(zip(LABELS.keys(), np.clip(vals, 0, 1)))
 
 
-def brain_svg(intensities, colors, state_label, focus_score, noise_score):
+def brain_svg(intensities, colors, state_label):
     cx, cy = 300, 220
     widths = {"delta": 210, "theta": 240, "alpha": 270, "beta": 300, "gamma": 330}
     opacities = {k: 0.12 + 0.62 * v for k, v in intensities.items()}
@@ -37,7 +39,7 @@ def brain_svg(intensities, colors, state_label, focus_score, noise_score):
 
     state_color = "#22c55e" if state_label == "Focus" else "#f59e0b"
     brain = f'''
-    <svg viewBox="0 0 600 440" width="100%" height="auto" xmlns="http://www.w3.org/2000/svg">
+    <svg viewBox="0 0 600 440" width="100%" height="400" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">
       <defs>
         <radialGradient id="glow" cx="50%" cy="45%" r="55%">
           <stop offset="0%" stop-color="#ffffff" stop-opacity="0.25"/>
@@ -58,7 +60,7 @@ def brain_svg(intensities, colors, state_label, focus_score, noise_score):
         <path d="M268 255c10 8 22 12 32 12s22-4 32-12" fill="none" stroke="#64748b" stroke-linecap="round"/>
       </g>
       <text x="300" y="78" text-anchor="middle" font-size="26" fill="#e2e8f0" font-family="Inter, system-ui, sans-serif">BCI Simulator</text>
-      <text x="300" y="372" text-anchor="middle" font-size="16" fill="#cbd5e1" font-family="Inter, system-ui, sans-serif">State {state_label} \u2022 Focus {focus_score:.0%} \u2022 Noise {noise_score:.0%}</text>
+      <text x="300" y="372" text-anchor="middle" font-size="16" fill="#cbd5e1" font-family="Inter, system-ui, sans-serif">Current state: {state_label}</text>
       <circle cx="300" cy="118" r="15" fill="{state_color}" fill-opacity="0.14"/>
       <circle cx="300" cy="118" r="7" fill="{state_color}"/>
     </svg>
@@ -80,17 +82,46 @@ st.markdown(
         padding: 18px;
         box-shadow: 0 0 40px rgba(56, 189, 248, 0.08);
     }
-    .state-focus {
-        color: #22c55e;
-        font-weight: 800;
-        font-size: 1.7rem;
-        letter-spacing: 0.03em;
+    .state-stack {
+        width: 100%;
+        background: rgba(30, 41, 59, 0.9);
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        border-radius: 999px;
+        overflow: hidden;
+        height: 22px;
+        display: flex;
+        box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.35);
     }
-    .state-noise {
-        color: #f59e0b;
-        font-weight: 800;
-        font-size: 1.7rem;
-        letter-spacing: 0.03em;
+    .state-focus-bar {
+        background: linear-gradient(90deg, #22c55e, #16a34a);
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        padding-left: 10px;
+        color: #eafff0;
+        font-size: 0.78rem;
+        font-weight: 700;
+        white-space: nowrap;
+    }
+    .state-noise-bar {
+        background: linear-gradient(90deg, #ef4444, #b91c1c);
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        padding-right: 10px;
+        color: #fff1f1;
+        font-size: 0.78rem;
+        font-weight: 700;
+        white-space: nowrap;
+    }
+    .state-legend {
+        display: flex;
+        justify-content: space-between;
+        margin-top: 0.35rem;
+        font-size: 0.86rem;
+        color: #cbd5e1;
     }
     </style>
     """,
@@ -106,21 +137,48 @@ frame, summary = sim.step()
 intensities = band_norms(summary)
 colors = config["colors"]
 
+focus_raw = max(float(summary.focus_score), 0.0)
+noise_raw = max(float(summary.noise_score), 0.0)
+state_total = focus_raw + noise_raw
+if state_total <= 1e-9:
+    focus_pct = 50.0
+    noise_pct = 50.0
+else:
+    focus_pct = 100.0 * focus_raw / state_total
+    noise_pct = 100.0 * noise_raw / state_total
+
 left, right = st.columns([1.35, 1])
 
 with left:
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown(brain_svg(intensities, colors, summary.state_label, summary.focus_score, summary.noise_score), unsafe_allow_html=True)
+    st.markdown(brain_svg(intensities, colors, summary.state_label), unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 with right:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.metric("Current State", summary.state_label)
-    st.metric("Focus Score", f"{summary.focus_score:.2f}")
-    st.metric("Noise Score", f"{summary.noise_score:.2f}")
+    peak_band = max(("delta", "theta", "alpha", "beta", "gamma"), key=lambda band: intensities[band]).title()
+    st.metric("Peak Band", peak_band)
+
+    st.write("State balance")
+    st.markdown(
+        f'''
+        <div class="state-stack" role="img" aria-label="Focus {focus_pct:.0f} percent and Noise {noise_pct:.0f} percent">
+          <div class="state-focus-bar" style="width: {focus_pct:.1f}%;">Focus {focus_pct:.0f}%</div>
+          <div class="state-noise-bar" style="width: {noise_pct:.1f}%;">Noise {noise_pct:.0f}%</div>
+        </div>
+        <div class="state-legend">
+          <span>Focus</span>
+          <span>Noise</span>
+        </div>
+        ''',
+        unsafe_allow_html=True,
+    )
+
     st.write("Band emphasis")
     for band in ["delta", "theta", "alpha", "beta", "gamma"]:
-        st.progress(float(intensities[band]))
+        floored = max(float(intensities[band]), 0.08)
+        st.progress(floored)
         st.caption(f"{LABELS[band]} \u2022 intensity {intensities[band]:.2f}")
     st.markdown('</div>', unsafe_allow_html=True)
 

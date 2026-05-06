@@ -56,6 +56,15 @@ DEFAULT_CONFIG = {
 }
 
 BANDS = ("delta", "theta", "alpha", "beta", "gamma")
+LEGACY_SIM_KEYS = {
+    "sample_rate": ("simulation", "sample_rate"),
+    "window_seconds": ("simulation", "window_seconds"),
+    "artifact_probability": ("simulation", "artifact_probability"),
+    "blink_probability": ("simulation", "blink_probability"),
+    "motion_probability": ("simulation", "motion_probability"),
+    "focus_threshold": ("thresholds", "focus"),
+    "noise_threshold": ("thresholds", "noise"),
+}
 
 
 @dataclass
@@ -82,26 +91,39 @@ class Muse2Simulator:
         self.window_seconds = int(sim["window_seconds"])
         self.n_samples = self.sample_rate * self.window_seconds
 
+    def _deep_update(self, target: Dict, updates: Dict) -> Dict:
+        for key, value in updates.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                self._deep_update(target[key], value)
+            else:
+                target[key] = value
+        return target
+
     def _merge_config(self, config: Dict) -> Dict:
         merged = json.loads(json.dumps(DEFAULT_CONFIG))
-
-        if any(key in config for key in ("sample_rate", "window_seconds", "bands")):
-            sim = merged["simulation"]
-            sim["sample_rate"] = config.get("sample_rate", sim["sample_rate"])
-            sim["window_seconds"] = config.get("window_seconds", sim["window_seconds"])
-            sim["artifact_probability"] = config.get("artifact_probability", sim["artifact_probability"])
-            sim["blink_probability"] = config.get("blink_probability", sim["blink_probability"])
-            sim["motion_probability"] = config.get("motion_probability", sim["motion_probability"])
-            thresholds = merged["thresholds"]
-            thresholds["focus"] = config.get("focus_threshold", thresholds["focus"])
-            thresholds["noise"] = config.get("noise_threshold", thresholds["noise"])
+        legacy_present = any(key in config for key in LEGACY_SIM_KEYS) or isinstance(config.get("bands"), dict)
+        if legacy_present:
+            for legacy_key, path in LEGACY_SIM_KEYS.items():
+                if legacy_key in config:
+                    section, key = path
+                    merged[section][key] = config[legacy_key]
+            if isinstance(config.get("simulation"), dict):
+                merged["simulation"] = self._deep_update(merged["simulation"], config["simulation"])
+            if isinstance(config.get("thresholds"), dict):
+                merged["thresholds"] = self._deep_update(merged["thresholds"], config["thresholds"])
+            if isinstance(config.get("band_weights"), dict):
+                merged["band_weights"] = self._deep_update(merged["band_weights"], config["band_weights"])
             if isinstance(config.get("colors"), dict):
-                merged["colors"].update(config["colors"])
+                merged["colors"] = self._deep_update(merged["colors"], config["colors"])
+            if isinstance(config.get("bands"), dict):
+                for band_name, band_cfg in config["bands"].items():
+                    if band_name in BANDS and isinstance(band_cfg, dict) and "mix" in band_cfg:
+                        merged["band_weights"]["raw_mix"][band_name] = band_cfg["mix"]
             return merged
 
         for key, value in config.items():
-            if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-                merged[key].update(value)
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = self._deep_update(merged[key], value)
             else:
                 merged[key] = value
         return merged
@@ -174,7 +196,8 @@ class Muse2Simulator:
 
     @staticmethod
     def _band_power(signal: np.ndarray) -> float:
-        return float(np.sqrt(np.mean(np.square(signal))))
+        centered = signal - np.mean(signal)
+        return float(np.sum(np.square(centered)) / max(len(centered), 1))
 
     def summarize(self, frame: pd.DataFrame) -> WindowSummary:
         powers = {band: self._band_power(frame[band].to_numpy()) for band in BANDS}
