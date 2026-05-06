@@ -1,0 +1,48 @@
+{
+  "simulation": {
+    "sample_rate": 256,
+    "window_seconds": 4,
+    "artifact_probability": 0.18,
+    "blink_probability": 0.08,
+    "motion_probability": 0.1,
+    "drift_strength": 0.85,
+    "base_noise": 1.8
+  },
+  "band_weights": {
+    "raw_mix": {
+      "delta": 0.8,
+      "theta": 0.75,
+      "alpha": 0.6,
+      "beta": 0.42,
+      "gamma": 0.22
+    },
+    "focus_score": {
+      "delta": -0.22,
+      "theta": -0.1,
+      "alpha": 0.48,
+      "beta": 0.3,
+      "gamma": 0.12,
+      "bias": 0.5
+    },
+    "noise_score": {
+      "delta": 0.4,
+      "theta": 0.28,
+      "alpha": 0.0,
+      "beta": 0.0,
+      "gamma": 0.18,
+      "raw_std": 0.14,
+      "bias": 0.0
+    }
+  },
+  "thresholds": {
+    "focus": 0.62,
+    "noise": 0.55
+  },
+  "colors": {
+    "delta": "#ff4d4f",
+    "theta": "#ff9f43",
+    "alpha": "#2ecc71",
+    "beta": "#3498db",
+    "gamma": "#9b59b6"
+  }
+}
