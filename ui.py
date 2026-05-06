@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import streamlit as st
 
@@ -5,7 +7,6 @@ from sim import Muse2Simulator, load_config
 
 st.set_page_config(page_title="BCI Simulator", page_icon="🧠", layout="wide")
 
-st.autorefresh(interval=1500, key="bci_sim_refresh")
 
 LABELS = {
     "delta": "Delta",
@@ -189,3 +190,12 @@ st.markdown('</div>', unsafe_allow_html=True)
 
 with st.expander("Configuration"):
     st.json(config)
+
+# keep the app live without extra dependencies
+placeholder = st.empty()
+placeholder.caption("Refreshing live view...")
+time.sleep(1.5)
+if hasattr(st, "rerun"):
+    st.rerun()
+else:
+    st.experimental_rerun()

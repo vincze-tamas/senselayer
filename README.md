@@ -29,9 +29,11 @@ The dashboard should include:
   - Gamma: Purple
 - Wave intensity and line width should react to simulator data
 - A clear current-state indicator for Focus / Noise
+- Replace separate Focus and Noise score fields with a single screen-wide horizontal bar representing 100% total
+- Show Focus and Noise as percentages inside the bar using two distinct colors, for example green for Focus and red/gray for Noise
 
 ## First coder task
-Implement sim.py so it can emit structured samples with band amplitudes and a state label, then implement ui.py as a Streamlit page that renders the head/brain outline, colored wave layers, and the current state.
+Implement sim.py so it can emit structured samples with band amplitudes and a state label, then implement ui.py as a Streamlit page that renders the head/brain outline, colored wave layers, the full-width Focus/Noise bar, and the current state.
 
 ## Notes
 Keep the UI visually strong and easy to read. The brain outline should feel like a demo-ready wow view rather than a plain chart.
