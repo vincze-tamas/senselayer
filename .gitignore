@@ -2,3 +2,10 @@
 __pycache__/
 .streamlit/
 *.pyc
+data/*.db
+data/*.json
+data/*.tmp
+pipeline/__pycache__/
+services/__pycache__/
+sources/__pycache__/
+scripts/__pycache__/
