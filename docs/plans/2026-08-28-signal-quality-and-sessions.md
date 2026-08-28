@@ -114,6 +114,7 @@ POST /sessions/{session_id}/events
 GET  /sessions/{session_id}/events
 GET  /sessions/{session_id}/samples?limit=5000
 GET  /sessions/{session_id}/export.csv
+GET  /sessions/{session_id}/events.csv
 ```
 
 `POST /sessions` returns `409` if another active session exists. Stop is idempotent: stopping a completed session returns its existing state. Event timestamps default to receiver time but accept an explicit finite Unix timestamp.
@@ -378,9 +379,9 @@ git commit -m "feat: attach incoming samples to active sessions"
 git commit -m "feat: add timestamped session event markers"
 ```
 
-### Task 10: Add session samples and CSV export
+### Task 10: Add session retrieval and CSV exports
 
-**Objective:** Provide bounded retrieval and deterministic export.
+**Objective:** Provide bounded retrieval plus deterministic feature-sample and event exports.
 
 **Files:**
 
@@ -395,17 +396,23 @@ session_id,timestamp,received_at,source,delta,theta,alpha,beta,gamma,
 signal_quality,quality_label,channel_quality_json,artifact_flags_json
 ```
 
+**Event CSV columns:**
+
+```text
+session_id,event_id,timestamp,kind,label
+```
+
 **Steps:**
 
-1. Add failing tests for ordering, empty session, row count, header order, quoting, and unknown session.
+1. Add failing tests for sample and event ordering, empty session, row counts, exact header order, quoting, and unknown session.
 2. Implement `/samples` with limit bounded to `1..5000`.
-3. Implement streaming CSV export without loading unbounded data into memory.
-4. Keep event retrieval on the dedicated JSON endpoint for this milestone. Do not invent a malformed multi-table CSV; add a separate `events.csv` endpoint only through a future scoped card.
+3. Implement streaming `export.csv` for feature samples without loading unbounded data into memory.
+4. Implement streaming `events.csv` with the exact event column contract above; an empty session returns headers and zero data rows.
 5. Run tests.
 6. Commit:
 
 ```bash
-git commit -m "feat: export session feature data as CSV"
+git commit -m "feat: export session features and events as CSV"
 ```
 
 ### Task 11: Add dashboard quality status
@@ -415,6 +422,7 @@ git commit -m "feat: export session feature data as CSV"
 **Files:**
 
 - Modify: `ui.py`
+- Modify: `deploy/systemd/senselayer-dashboard.service`
 - Create: `tests/test_dashboard_helpers.py`
 
 **Steps:**
@@ -423,9 +431,10 @@ git commit -m "feat: export session feature data as CSV"
 2. Test `good`, `marginal`, `bad`, and `unknown` behavior.
 3. Display aggregate quality, per-channel quality, and artifact flags above derived bands.
 4. When quality is `bad` or `unknown`, replace State/Focus with `Suppressed: insufficient signal quality`.
-5. Do not silently fall back to simulation when a stale live source exists; label simulation explicitly and require an environment setting to permit it in production.
-6. Run tests and visually inspect the dashboard through the SSH tunnel.
-7. Commit:
+5. Add `SENSELAYER_ALLOW_SIMULATION`, parsed case-insensitively from `1|true|yes|on`, with a fail-closed default of `false`. Check it in `ui.py` before constructing `Muse2Simulator`; when disabled and live data is absent/stale, show `Live data unavailable` and do not fabricate a sample. Set `Environment=SENSELAYER_ALLOW_SIMULATION=false` explicitly in the production dashboard unit.
+6. Test both branches: unset/false never enters simulation; true permits simulation and labels the source `sim`.
+7. Run tests and visually inspect the dashboard through the SSH tunnel.
+8. Commit:
 
 ```bash
 git commit -m "feat: gate dashboard metrics by signal quality"
@@ -531,6 +540,8 @@ Tasks 1–3 and 4 can run as separate workstreams, but Task 5 is the merge gate.
 - [ ] Legacy collector payload remains accepted during rollout.
 - [ ] Database migration is idempotent and non-destructive.
 - [ ] Retention cannot delete saved-session samples.
+- [ ] Feature and event CSV exports both have exact schemas and tests.
 - [ ] Dashboard cannot show derived mental-state labels for bad/unknown quality.
+- [ ] Simulation is fail-closed unless `SENSELAYER_ALLOW_SIMULATION=true` is explicitly set.
 - [ ] No public listener, weaker SSH option, or new secret is introduced.
 - [ ] Hardware and reboot gates remain user-only; all technical work remains agent-owned.
