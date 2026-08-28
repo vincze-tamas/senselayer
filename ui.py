@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -13,7 +14,7 @@ from sources.live_source import LiveFileSource
 st.set_page_config(page_title="BCI Simulator", page_icon="🧠", layout="wide")
 
 LABELS = {"delta": "Delta", "theta": "Theta", "alpha": "Alpha", "beta": "Beta", "gamma": "Gamma"}
-DB_PATH = Path("data/history.db")
+DB_PATH = Path(os.environ.get("SENSELAYER_DATA_DIR", "data")) / "history.db"
 
 
 def band_norms(values):

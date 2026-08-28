@@ -1,132 +1,89 @@
-# BCI Live Pipeline (Muse 2 to Edge to VPS to Dashboard)
+# SenseLayer
 
-A lightweight BCI pipeline for streaming Muse 2 EEG-derived band powers from a Windows edge device to a VPS, storing history, and visualizing live plus historical signals in Streamlit.
+Muse 2 EEG collector, private receiver and dashboard. The receiver and dashboard are intentionally loopback-only on `dn-dev-01`; Windows reaches them through a pinned-host-key SSH tunnel.
 
-## What this repository contains
+## Security model
 
-1) Live ingestion backend (FastAPI receiver)
-2) Edge collector (Windows, Muse 2 via LSL)
-3) History storage (SQLite)
-4) Live plus history dashboard (Streamlit)
-5) Simulation fallback (when no live sample is available)
+- Server listeners: `127.0.0.1:8787` and `127.0.0.1:8501` only.
+- Windows forwards: `127.0.0.1:18787 -> server 127.0.0.1:8787` and `127.0.0.1:18501 -> server 127.0.0.1:8501`.
+- SSH uses a dedicated key, strict host-key verification, keepalives and fail-closed forwarding.
+- No password authentication and no public firewall rules for 8501/8787.
 
-## End-to-end architecture
+## Windows 11 installation — gated live step
 
-Muse 2 headset
--> muselsl stream on Windows
--> edge collector (Python)
--> HTTP POST /sample to VPS receiver
--> data/latest_sample.json and data/history.db
--> Streamlit dashboard (live bands + time-series history)
+Do **not** run this until the Windows change gate is approved.
 
-## Repository structure
+1. Install current Windows updates, Python 3.11 and the built-in OpenSSH Client.
+2. Charge Muse 2, disconnect it from phones/tablets, and enable Windows Bluetooth.
+3. Copy the `scripts` directory locally.
+4. In normal PowerShell, run:
 
-- ui.py
-  - Streamlit dashboard
-  - Displays current state, current band values, and history chart
-  - Falls back to simulator if no live data is available
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install_windows.ps1
+```
 
-- services/receiver.py
-  - FastAPI server
-  - Endpoints:
-    - POST /sample: ingest one sample
-    - GET /health: freshness, age, status
-    - GET /history?limit=N: recent samples from SQLite
+First run generates `%USERPROFILE%\.ssh\senselayer_ed25519` and deliberately stops if its public key is not authorized on `dn-dev-01`. Add the displayed `.pub` key to the dedicated server account, then rerun the same command. Reruns are safe and update the venv, scripts, config and Task Scheduler entry.
 
-- sources/live_source.py
-  - Reads latest sample from data/latest_sample.json
-  - Returns last good sample on transient read errors
+The installer pins the current dn-dev-01 ED25519 fingerprint:
 
-- pipeline/processor.py
-  - Signal post-processing and state scoring (Focus vs Noise)
+```text
+SHA256:mAUvRHWRLdip9jdSZqsJLdBE/v+yK3PJy1F8wc4Hrh0
+```
 
-- sim.py
-  - Synthetic EEG simulator used as fallback/demo source
+A mismatch is a hard failure. Do not bypass it.
 
-- scripts/muse2_edge_collector.py
-  - Edge collector script:
-    - reads EEG stream via LSL
-    - computes normalized delta/theta/alpha/beta/gamma powers
-    - posts samples to receiver
+## Exact live Muse 2 verification
 
-- scripts/install_edge_v2.ps1
-  - Windows setup script for edge host
-  - Creates venv, installs dependencies, registers Task Scheduler autostart
+1. Press Muse power until the light is on. Keep it within one metre of the PC.
+2. Remove competing phone/tablet connections. Muse supports one active BLE connection.
+3. Check discovery before autostart:
 
-- scripts/EDGE_README.txt
-  - Short Windows edge setup notes
+```powershell
+$Base = "$env:LOCALAPPDATA\SenseLayer"
+& "$Base\.venv\Scripts\muselsl.exe" list
+```
 
-- config.json
-  - Simulator and visual config
+Expected: a Muse device name/address. If none appears, toggle Bluetooth, power-cycle Muse, then retry. Windows Bluetooth pairing is not required by every adapter; discovery by `muselsl list` is the deciding check.
 
-- requirements.txt
-  - Python dependencies for dashboard plus receiver
+4. Start the installed pipeline:
 
-## Data model
+```powershell
+schtasks /Run /TN SenseLayerMuse2
+Start-Sleep 15
+Get-Content "$env:LOCALAPPDATA\SenseLayer\senselayer.log" -Tail 80
+```
 
-Each sample posted to receiver contains:
-- timestamp
-- source
-- delta
-- theta
-- alpha
-- beta
-- gamma
-- signal_quality
+Expected log sequence: `starting SSH tunnel`, `starting muselsl`, `starting collector`, `Connected to LSL stream`.
 
-Band values are normalized proportions from computed spectral power.
-Receiver stores both original timestamp and server-side received_at.
+5. Verify receiver freshness through the tunnel:
 
-## Local run (VPS side)
+```powershell
+Invoke-RestMethod http://127.0.0.1:18787/health | Format-List
+```
 
-1) Create venv and install dependencies
-- python3 -m venv .venv
-- source .venv/bin/activate
-- pip install -r requirements.txt
+Expected: `ok=True`, `status=fresh`, `source=muse2-edge-win11`, and `age_sec` under 15.
 
-2) Start receiver API
-- uvicorn services.receiver:app --host 0.0.0.0 --port 8787
+6. Open `http://127.0.0.1:18501`. Expected source is `live`, history grows roughly once per second, and the five normalized bands move.
+7. Disconnect test: power Muse off for 20 seconds. The log must show a stale/exit and a supervised retry. Power it on; `health` must return to `fresh` without manual process cleanup.
+8. Tunnel test: disconnect network for 30 seconds and reconnect. The SSH process must fail and the supervisor must recreate the whole pipeline.
+9. Reboot Windows and log in. The `SenseLayerMuse2` task must start automatically and health must become fresh without opening PowerShell.
 
-3) Start dashboard
-- streamlit run ui.py --server.port 8501 --server.address 0.0.0.0
+## Simulated edge test
 
-## Windows edge setup (Muse 2)
+Set `simulate` to `true` in `%LOCALAPPDATA%\SenseLayer\config.json`, start the task, and verify `/health` and dashboard. Set it back to `false` before live Muse testing.
 
-On Windows machine (PowerShell as Administrator):
-- powershell -ExecutionPolicy Bypass -File ./scripts/install_edge_v2.ps1
+## Rollback
 
-Then pair Muse 2 once in Windows Bluetooth settings.
+```powershell
+powershell -ExecutionPolicy Bypass -File .\uninstall_windows.ps1
+```
 
-Runtime flow on edge:
-1) start muselsl stream
-2) connect to LSL EEG stream
-3) compute band powers on sliding window
-4) send to VPS receiver at /sample
-5) auto-retry on temporary failures
+This removes autostart but keeps files and keys for rollback. No server port needs opening.
 
-## Health and verification
+## Developer test
 
-- Receiver health:
-  curl http://127.0.0.1:8787/health
-
-- Latest history rows:
-  curl http://127.0.0.1:8787/history?limit=5
-
-- Dashboard URL:
-  http://<host>:8501
-
-## Operational notes
-
-- data/ contains runtime artifacts (history.db, latest_sample.json) and is git-ignored.
-- If no fresh live data arrives, dashboard status becomes stale and simulator fallback can still render.
-- Slightly jagged curves are expected due to short-window FFT plus sensor/contact jitter.
-
-## Status
-
-Current codebase supports:
-- Live Muse 2 ingestion
-- Persistent history storage
-- Streamlit live/history visualization
-- Windows edge bootstrap and autostart path
-
-This repository is a practical baseline for real-time BCI prototyping, not medical-grade signal processing.
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+.venv/bin/pytest -q
+```

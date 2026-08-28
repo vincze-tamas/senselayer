@@ -1,0 +1,44 @@
+[Unit]
+Description=SenseLayer Streamlit Dashboard
+After=network-online.target senselayer-receiver.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=senselayer
+Group=senselayer
+WorkingDirectory=/opt/apps/senselayer
+Environment=SENSELAYER_DATA_DIR=/opt/apps/senselayer/data
+ExecStart=/opt/apps/senselayer/.venv/bin/streamlit run ui.py --server.port 8501 --server.address 127.0.0.1 --server.headless true --browser.gatherUsageStats false
+Restart=always
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+RemoveIPC=true
+ReadWritePaths=/opt/apps/senselayer/data
+
+[Install]
+WantedBy=multi-user.target
