@@ -325,6 +325,121 @@ def test_complete_session_is_idempotent(tmp_path: Path) -> None:
         connection.close()
 
 
+def test_complete_session_rejects_end_before_latest_event_without_mutation(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        created = _create_session(connection)
+        event = create_session_event(
+            connection, session_id=str(created["id"]), kind="future", timestamp=175.0
+        )
+
+        with pytest.raises(ValueError, match="event timestamp"):
+            complete_session(connection, str(created["id"]), ended_at=150.0)
+
+        assert get_session(connection, str(created["id"])) == created
+        assert list_session_events(connection, session_id=str(created["id"])) == [event]
+    finally:
+        connection.close()
+
+
+def test_complete_session_preserves_caller_owned_transaction_on_bound_failure(
+    tmp_path: Path,
+) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        created = _create_session(connection)
+        create_session_event(
+            connection, session_id=str(created["id"]), kind="future", timestamp=175.0
+        )
+        connection.execute("BEGIN IMMEDIATE")
+
+        with pytest.raises(ValueError, match="event timestamp"):
+            complete_session(connection, str(created["id"]), ended_at=150.0)
+
+        assert connection.in_transaction is True
+        connection.rollback()
+        assert get_session(connection, str(created["id"])) == created
+    finally:
+        connection.close()
+
+
+def test_complete_session_preserves_successful_caller_owned_transaction(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        created = _create_session(connection)
+        connection.execute("BEGIN")
+
+        completed = complete_session(connection, str(created["id"]), ended_at=150.0)
+
+        assert completed is not None
+        assert completed["status"] == "completed"
+        assert connection.in_transaction is True
+        connection.rollback()
+        assert get_session(connection, str(created["id"])) == created
+    finally:
+        connection.close()
+
+
+def test_complete_session_holds_write_lock_through_event_bound_check(tmp_path: Path) -> None:
+    database_path = tmp_path / "history.db"
+    setup_connection = connect_database(database_path)
+    session = _create_session(setup_connection)
+    setup_connection.close()
+
+    begin_seen = threading.Event()
+    release = threading.Event()
+
+    class InterceptingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = (), /):  # type: ignore[override]
+            result = super().execute(sql, parameters)
+            if sql == "BEGIN IMMEDIATE":
+                begin_seen.set()
+                assert release.wait(timeout=5)
+            return result
+
+    complete_connection = sqlite3.connect(
+        database_path, timeout=10, factory=InterceptingConnection, check_same_thread=False
+    )
+    event_connection = sqlite3.connect(database_path, timeout=0.1, check_same_thread=False)
+    result: dict[str, Any] = {}
+    event_error: list[BaseException] = []
+
+    def complete() -> None:
+        result["session"] = complete_session(
+            complete_connection, str(session["id"]), ended_at=150.0
+        )
+
+    def add_event() -> None:
+        try:
+            create_session_event(
+                event_connection,
+                session_id=str(session["id"]),
+                kind="marker",
+                timestamp=140.0,
+            )
+        except BaseException as error:
+            event_error.append(error)
+
+    completer = threading.Thread(target=complete)
+    completer.start()
+    assert begin_seen.wait(timeout=5)
+    event_writer = threading.Thread(target=add_event)
+    event_writer.start()
+    event_writer.join(timeout=5)
+    release.set()
+    completer.join(timeout=5)
+
+    try:
+        assert completer.is_alive() is False
+        assert event_writer.is_alive() is False
+        assert result["session"]["status"] == "completed"
+        assert event_error and isinstance(event_error[0], sqlite3.OperationalError)
+        assert list_session_events(complete_connection, session_id=str(session["id"])) == []
+    finally:
+        complete_connection.close()
+        event_connection.close()
+
+
 def test_abort_session_closes_active_session_and_allows_reopen(tmp_path: Path) -> None:
     database_path = tmp_path / "history.db"
     connection = connect_database(database_path)
@@ -392,6 +507,28 @@ def test_create_session_event_rejects_missing_session_aborted_and_out_of_interva
         with pytest.raises(ValueError):
             create_session_event(connection, session_id=str(session["id"]), kind="start", timestamp=201.0)
         assert connection.execute("SELECT COUNT(*) FROM session_events").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_abort_keeps_existing_markers_but_rejects_new_ones(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        session = _create_session(connection)
+        historical = create_session_event(
+            connection, session_id=str(session["id"]), kind="historical", timestamp=150.0
+        )
+
+        aborted = abort_session(connection, str(session["id"]), ended_at=140.0)
+
+        assert aborted is not None
+        assert aborted["status"] == "aborted"
+        assert list_session_events(connection, session_id=str(session["id"])) == [historical]
+        with pytest.raises(ValueError, match="aborted"):
+            create_session_event(
+                connection, session_id=str(session["id"]), kind="late", timestamp=130.0
+            )
+        assert list_session_events(connection, session_id=str(session["id"])) == [historical]
     finally:
         connection.close()
 

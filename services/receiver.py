@@ -336,7 +336,10 @@ def add_session_event(session_id: str, request: SessionEventCreate) -> dict[str,
 @app.post("/sessions/{session_id}/stop", response_model=SessionResponse)
 def stop_session(session_id: str) -> dict[str, Any]:
     with closing(_connect()) as connection:
-        session = complete_session(connection, session_id, ended_at=time.time())
+        try:
+            session = complete_session(connection, session_id, ended_at=time.time())
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
     if session is None:
         raise HTTPException(status_code=404, detail="session not found")
     return session

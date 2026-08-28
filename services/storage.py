@@ -246,7 +246,37 @@ def _finish_session(
 def complete_session(
     connection: sqlite3.Connection, session_id: str, *, ended_at: float
 ) -> dict[str, Any] | None:
-    return _finish_session(connection, session_id, ended_at=ended_at, status="completed")
+    started_transaction = False
+    if not connection.in_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+        started_transaction = True
+    try:
+        # Acquire the write lock before checking event bounds when the caller
+        # supplied a deferred transaction.
+        connection.execute(
+            "UPDATE sessions SET status = status WHERE id = ? AND status = 'active'",
+            (session_id,),
+        )
+        session = get_session(connection, session_id)
+        if session is not None and session["status"] == "active":
+            latest_event_at = connection.execute(
+                "SELECT MAX(timestamp) FROM session_events WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            if latest_event_at is not None and latest_event_at > ended_at:
+                raise ValueError("session end precedes existing event timestamp")
+            connection.execute(
+                "UPDATE sessions SET ended_at = ?, status = 'completed' WHERE id = ?",
+                (ended_at, session_id),
+            )
+            session = get_session(connection, session_id)
+        if started_transaction:
+            connection.commit()
+        return session
+    except BaseException:
+        if started_transaction and connection.in_transaction:
+            connection.rollback()
+        raise
 
 
 def abort_session(

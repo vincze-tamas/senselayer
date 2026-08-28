@@ -295,7 +295,6 @@ def test_session_events_accept_explicit_timestamp_and_order(monkeypatch, tmp_pat
     monkeypatch.setattr(receiver.time, "time", lambda: 100.0)
     created = client.post("/sessions", json={"name": "eventful"}).json()
     session_id = created["id"]
-
     assert client.post(
         f"/sessions/{session_id}/events", json={"kind": "b", "timestamp": 130.0}
     ).status_code == 201
@@ -306,6 +305,30 @@ def test_session_events_accept_explicit_timestamp_and_order(monkeypatch, tmp_pat
     events = client.get(f"/sessions/{session_id}/events").json()["items"]
     assert [event["kind"] for event in events] == ["a", "b"]
     assert [event["timestamp"] for event in events] == [120.0, 130.0]
+
+
+def test_stop_rejects_end_before_existing_event_without_mutating_session(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 100.0)
+    created = client.post("/sessions", json={"name": "eventful"}).json()
+    monkeypatch.setattr(receiver.time, "time", lambda: 200.0)
+    event = client.post(
+        f"/sessions/{created['id']}/events",
+        json={"kind": "later", "timestamp": 175.0},
+    ).json()
+    monkeypatch.setattr(receiver.time, "time", lambda: 150.0)
+
+    response = client.post(f"/sessions/{created['id']}/stop")
+
+    assert response.status_code == 409
+    assert "event timestamp" in response.json()["detail"]
+    assert client.get(f"/sessions/{created['id']}").json() == created
+    assert client.get(f"/sessions/{created['id']}/events").json() == {
+        "count": 1,
+        "items": [event],
+    }
 
 
 @pytest.mark.parametrize(
