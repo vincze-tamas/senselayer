@@ -14,7 +14,8 @@ Safe local-only verification for the signal-quality and sessions milestone:
 
 - `.venv/bin/pytest -q`: 178 passed.
 - `python3 -m compileall -q services sources pipeline scripts sim.py ui.py`: passed.
-- `git diff --check`: passed.
+- `git diff --check 632783a..HEAD`: passed for the cumulative Task 13 range.
+- `git status --porcelain`: empty after the final commit.
 - PowerShell parser validation for `scripts/install_windows.ps1` with Docker: passed.
 
 These checks cover repository integrity only. Live receiver/dashboard checks, physical Muse acceptance, SSH tunnel recovery, reboot validation, and deployment-side health probes remain a separate live gate.

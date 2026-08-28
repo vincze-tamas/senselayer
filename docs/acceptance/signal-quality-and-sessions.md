@@ -17,7 +17,8 @@ The Task 13 controller completed the safe local-only checks with these results:
 
 - `.venv/bin/pytest -q`: 178 passed with one pre-existing third-party deprecation warning.
 - `python3 -m compileall -q services sources pipeline scripts sim.py ui.py`: passed.
-- `git diff --check`: passed.
+- `git diff --check 632783a..HEAD`: passed for the cumulative Task 13 range.
+- `git status --porcelain`: empty after the final commit.
 - PowerShell parser validation for `scripts/install_windows.ps1` using Docker: passed.
 
   ```bash
