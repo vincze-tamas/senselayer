@@ -267,6 +267,126 @@ def test_missing_session_detail_and_stop_return_404(monkeypatch, tmp_path):
     assert client.post("/sessions/missing/stop").status_code == 404
 
 
+def test_session_events_default_timestamp_and_listing(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 100.0)
+    created = client.post("/sessions", json={"name": "eventful"}).json()
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 110.0)
+    response = client.post(f"/sessions/{created['id']}/events", json={"kind": "marker", "label": "start"})
+
+    assert response.status_code == 201
+    assert response.json()["timestamp"] == 110.0
+    events = client.get(f"/sessions/{created['id']}/events").json()
+    assert events == {"count": 1, "items": [response.json()]}
+
+
+def test_session_events_accept_explicit_timestamp_and_order(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 100.0)
+    created = client.post("/sessions", json={"name": "eventful"}).json()
+    session_id = created["id"]
+
+    assert client.post(
+        f"/sessions/{session_id}/events", json={"kind": "b", "timestamp": 130.0}
+    ).status_code == 201
+    assert client.post(
+        f"/sessions/{session_id}/events", json={"kind": "a", "timestamp": 120.0, "label": "left"}
+    ).status_code == 201
+
+    events = client.get(f"/sessions/{session_id}/events").json()["items"]
+    assert [event["kind"] for event in events] == ["a", "b"]
+    assert [event["timestamp"] for event in events] == [120.0, 130.0]
+
+
+@pytest.mark.parametrize(
+    "payload,status_code",
+    [
+        ({"kind": ""}, 422),
+        ({"kind": "x" * 65}, 422),
+        ({"kind": "ok", "label": "x" * 121}, 422),
+    ],
+)
+def test_session_event_validation_rejects_invalid_kind_label_and_timestamp(
+    monkeypatch, tmp_path, payload, status_code
+):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 100.0)
+    created = client.post("/sessions", json={"name": "eventful"}).json()
+    response = client.post(f"/sessions/{created['id']}/events", json=payload)
+
+    assert response.status_code == status_code
+
+
+def test_session_event_missing_session_returns_404(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    assert client.post("/sessions/missing/events", json={"kind": "marker"}).status_code == 404
+    assert client.get("/sessions/missing/events").status_code == 404
+
+
+def test_completed_session_event_timestamps_must_fall_within_session_interval(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 100.0)
+    created = client.post("/sessions", json={"name": "eventful"}).json()
+    session_id = created["id"]
+    monkeypatch.setattr(receiver.time, "time", lambda: 200.0)
+    client.post(f"/sessions/{session_id}/stop")
+
+    for timestamp in (99.0, 201.0):
+        response = client.post(
+            f"/sessions/{session_id}/events",
+            json={"kind": "marker", "timestamp": timestamp},
+        )
+        assert response.status_code == 409
+
+    assert client.post(
+        f"/sessions/{session_id}/events", json={"kind": "marker", "timestamp": 100.0}
+    ).status_code == 201
+    assert client.post(
+        f"/sessions/{session_id}/events", json={"kind": "marker", "timestamp": 200.0}
+    ).status_code == 201
+
+
+def test_aborted_session_rejects_event_markers(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 100.0)
+    created = client.post("/sessions", json={"name": "eventful"}).json()
+    with closing(receiver._connect()) as connection:
+        connection.execute(
+            "UPDATE sessions SET status = 'aborted', ended_at = ? WHERE id = ?",
+            (150.0, created["id"]),
+        )
+        connection.commit()
+
+    response = client.post(f"/sessions/{created['id']}/events", json={"kind": "marker"})
+    assert response.status_code == 409
+    assert client.get(f"/sessions/{created['id']}/events").json() == {"count": 0, "items": []}
+
+
+def test_active_session_event_timestamp_cannot_precede_session_start(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 100.0)
+    created = client.post("/sessions", json={"name": "eventful"}).json()
+    response = client.post(
+        f"/sessions/{created['id']}/events", json={"kind": "marker", "timestamp": 99.0}
+    )
+    assert response.status_code == 409
+
+
 @pytest.mark.parametrize(
     "payload",
     [

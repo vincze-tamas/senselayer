@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
+import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
@@ -39,6 +41,7 @@ def _normalise_session_id(session_id: Any) -> str | None:
         return None
     return str(session_id)
 
+
 _SESSION_COLUMNS = (
     "id",
     "name",
@@ -49,6 +52,14 @@ _SESSION_COLUMNS = (
     "status",
     "software_version",
     "created_at",
+)
+
+_SESSION_EVENT_COLUMNS = (
+    "id",
+    "session_id",
+    "timestamp",
+    "kind",
+    "label",
 )
 
 
@@ -131,6 +142,12 @@ def migrate(connection: sqlite3.Connection) -> None:
             ON sessions(status) WHERE status = 'active'
             """
         )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_session_events_session_timestamp
+            ON session_events(session_id, timestamp, id)
+            """
+        )
         connection.commit()
     except BaseException:
         connection.rollback()
@@ -139,6 +156,10 @@ def migrate(connection: sqlite3.Connection) -> None:
 
 def _session_from_row(row: tuple[Any, ...] | sqlite3.Row) -> dict[str, Any]:
     return dict(zip(_SESSION_COLUMNS, row, strict=True))
+
+
+def _session_event_from_row(row: tuple[Any, ...] | sqlite3.Row) -> dict[str, Any]:
+    return dict(zip(_SESSION_EVENT_COLUMNS, row, strict=True))
 
 
 def create_session(
@@ -226,6 +247,78 @@ def abort_session(
     connection: sqlite3.Connection, session_id: str, *, ended_at: float
 ) -> dict[str, Any] | None:
     return _finish_session(connection, session_id, ended_at=ended_at, status="aborted")
+
+
+def create_session_event(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    timestamp: float | None = None,
+    kind: str,
+    label: str = "",
+) -> dict[str, Any]:
+    started_transaction = False
+    if not connection.in_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+        started_transaction = True
+    try:
+        session = get_session(connection, session_id)
+        if session is None:
+            raise LookupError("session not found")
+        if session["status"] == "aborted":
+            raise ValueError("markers are not allowed on aborted sessions")
+        if session["status"] not in {"active", "completed"}:
+            raise ValueError("markers are only allowed on active or completed sessions")
+        if timestamp is None:
+            timestamp = time.time()
+        if not math.isfinite(float(timestamp)):
+            raise ValueError("invalid event timestamp")
+        kind = kind.strip()
+        label = label.strip()
+        if not kind or len(kind) > 64:
+            raise ValueError("invalid event kind")
+        if len(label) > 120:
+            raise ValueError("invalid event label")
+        if timestamp < session["started_at"]:
+            raise ValueError("event timestamp precedes session start")
+        ended_at = session["ended_at"]
+        if ended_at is not None and timestamp > ended_at:
+            raise ValueError("event timestamp exceeds completed session interval")
+        cursor = connection.execute(
+            """
+            INSERT INTO session_events(session_id, timestamp, kind, label)
+            VALUES(?,?,?,?)
+            """,
+            (session_id, timestamp, kind, label),
+        )
+        row = connection.execute(
+            "SELECT id, session_id, timestamp, kind, label FROM session_events WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+        if row is None:
+            raise LookupError("inserted event not found")
+        if started_transaction:
+            connection.commit()
+        return _session_event_from_row(row)
+    except BaseException:
+        if started_transaction and connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+def list_session_events(
+    connection: sqlite3.Connection, *, session_id: str
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT id, session_id, timestamp, kind, label
+        FROM session_events
+        WHERE session_id = ?
+        ORDER BY timestamp ASC, id ASC
+        """,
+        (session_id,),
+    ).fetchall()
+    return [_session_event_from_row(row) for row in rows]
 
 
 def insert_sample(

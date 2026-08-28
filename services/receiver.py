@@ -17,9 +17,11 @@ from services.storage import (
     complete_session,
     connect_database,
     create_session,
+    create_session_event,
     fetch_sample_history,
     get_session,
     insert_sample,
+    list_session_events,
     list_sessions,
 )
 
@@ -59,6 +61,33 @@ class SessionResponse(BaseModel):
 class SessionListResponse(BaseModel):
     count: int = Field(ge=0)
     items: list[SessionResponse]
+
+
+class SessionEventCreate(BaseModel):
+    kind: str = Field(min_length=1, max_length=64)
+    label: str = Field(default="", max_length=120)
+    timestamp: float | None = Field(default=None, allow_inf_nan=False)
+
+    @field_validator("kind")
+    @classmethod
+    def strip_kind(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("kind must not be empty")
+        return value
+
+
+class SessionEventResponse(BaseModel):
+    id: int
+    session_id: UUID
+    timestamp: float = Field(allow_inf_nan=False)
+    kind: str = Field(min_length=1, max_length=64)
+    label: str = Field(max_length=120)
+
+
+class SessionEventListResponse(BaseModel):
+    count: int = Field(ge=0)
+    items: list[SessionEventResponse]
 
 
 class Sample(BaseModel):
@@ -111,6 +140,27 @@ def _validated_payload(sample: Sample) -> dict[str, Any]:
     if not math.isfinite(quality) or not 0.0 <= quality <= 1.0:
         raise HTTPException(status_code=400, detail="invalid signal_quality")
     return payload
+
+
+def _session_event_payload(connection: sqlite3.Connection, session_id: str, event: SessionEventCreate) -> dict[str, Any]:
+    session = get_session(connection, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    timestamp = time.time() if event.timestamp is None else event.timestamp
+    if not math.isfinite(float(timestamp)):
+        raise HTTPException(status_code=422, detail="invalid timestamp")
+    try:
+        return create_session_event(
+            connection,
+            session_id=session_id,
+            timestamp=float(timestamp),
+            kind=event.kind,
+            label=event.label,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail="session not found") from error
 
 
 @app.get("/ready")
@@ -182,6 +232,21 @@ def session_detail(session_id: str) -> dict[str, Any]:
     if session is None:
         raise HTTPException(status_code=404, detail="session not found")
     return session
+
+
+@app.get("/sessions/{session_id}/events", response_model=SessionEventListResponse)
+def session_events(session_id: str) -> dict[str, Any]:
+    with closing(_connect()) as connection:
+        if get_session(connection, session_id) is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        items = list_session_events(connection, session_id=session_id)
+    return {"count": len(items), "items": items}
+
+
+@app.post("/sessions/{session_id}/events", response_model=SessionEventResponse, status_code=201)
+def add_session_event(session_id: str, request: SessionEventCreate) -> dict[str, Any]:
+    with closing(_connect()) as connection:
+        return _session_event_payload(connection, session_id, request)
 
 
 @app.post("/sessions/{session_id}/stop", response_model=SessionResponse)

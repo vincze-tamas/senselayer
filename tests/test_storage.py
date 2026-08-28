@@ -18,6 +18,8 @@ from services.storage import (
     get_session,
     insert_sample,
     list_sessions,
+    create_session_event,
+    list_session_events,
     migrate,
 )
 
@@ -350,5 +352,134 @@ def test_session_transitions_return_none_for_unknown_id(tmp_path: Path) -> None:
         assert get_session(connection, "missing") is None
         assert complete_session(connection, "missing", ended_at=150.0) is None
         assert abort_session(connection, "missing", ended_at=150.0) is None
+    finally:
+        connection.close()
+
+
+def test_session_events_round_trip_and_deterministic_ordering(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        session = _create_session(connection)
+        create_session_event(connection, session_id=str(session["id"]), kind="start", timestamp=100.0)
+        create_session_event(
+            connection, session_id=str(session["id"]), kind="sample", timestamp=150.0, label="beta"
+        )
+        create_session_event(connection, session_id=str(session["id"]), kind="stop", timestamp=120.0)
+
+        events = list_session_events(connection, session_id=str(session["id"]))
+    finally:
+        connection.close()
+
+    assert [event["kind"] for event in events] == ["start", "stop", "sample"]
+    assert [event["timestamp"] for event in events] == [100.0, 120.0, 150.0]
+    assert events[1]["label"] == ""
+
+
+def test_create_session_event_rejects_missing_session_aborted_and_out_of_interval(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        session = _create_session(connection)
+        complete_session(connection, str(session["id"]), ended_at=200.0)
+        aborted = _create_session(connection, name="aborted", created_at=102.0)
+        abort_session(connection, str(aborted["id"]), ended_at=180.0)
+
+        with pytest.raises(LookupError):
+            create_session_event(connection, session_id="missing", kind="start")
+        with pytest.raises(ValueError):
+            create_session_event(connection, session_id=str(aborted["id"]), kind="start", timestamp=150.0)
+        with pytest.raises(ValueError):
+            create_session_event(connection, session_id=str(session["id"]), kind="start", timestamp=99.0)
+        with pytest.raises(ValueError):
+            create_session_event(connection, session_id=str(session["id"]), kind="start", timestamp=201.0)
+        assert connection.execute("SELECT COUNT(*) FROM session_events").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_create_session_event_blocks_concurrent_stop_until_insert_commits(tmp_path: Path) -> None:
+    database_path = tmp_path / "history.db"
+    connection = connect_database(database_path)
+    session = _create_session(connection)
+    connection.close()
+
+    begin_seen = threading.Event()
+    release = threading.Event()
+
+    class InterceptingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = (), /):  # type: ignore[override]
+            if sql == "BEGIN IMMEDIATE":
+                result = super().execute(sql, parameters)
+                begin_seen.set()
+                assert release.wait(timeout=5)
+                return result
+            return super().execute(sql, parameters)
+
+    event_connection = sqlite3.connect(
+        database_path, timeout=10, factory=InterceptingConnection, check_same_thread=False
+    )
+    stop_connection = sqlite3.connect(database_path, timeout=0.1, check_same_thread=False)
+    result: dict[str, Any] = {}
+    stop_error: list[BaseException] = []
+
+    def add_event() -> None:
+        result["event"] = create_session_event(
+            event_connection,
+            session_id=str(session["id"]),
+            kind="marker",
+            timestamp=150.0,
+        )
+
+    def stop_session() -> None:
+        try:
+            stop_session = abort_session(stop_connection, str(session["id"]), ended_at=200.0)
+            result["stop"] = stop_session
+        except BaseException as error:
+            stop_error.append(error)
+
+    worker = threading.Thread(target=add_event)
+    worker.start()
+    assert begin_seen.wait(timeout=5)
+
+    stopper = threading.Thread(target=stop_session)
+    stopper.start()
+    stopper.join(timeout=5)
+    release.set()
+    worker.join(timeout=5)
+
+    try:
+        assert worker.is_alive() is False
+        assert stopper.is_alive() is False
+        assert result["event"]["session_id"] == session["id"]
+        assert stop_error and isinstance(stop_error[0], sqlite3.OperationalError)
+        stored = event_connection.execute(
+            "SELECT kind, timestamp FROM session_events ORDER BY id"
+        ).fetchall()
+        assert stored == [("marker", 150.0)]
+    finally:
+        event_connection.close()
+        stop_connection.close()
+
+
+@pytest.mark.parametrize("timestamp", [float("nan"), float("inf"), float("-inf")])
+def test_create_session_event_rejects_non_finite_timestamps(tmp_path: Path, timestamp: float) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        session = _create_session(connection)
+        with pytest.raises(ValueError):
+            create_session_event(connection, session_id=str(session["id"]), kind="start", timestamp=timestamp)
+        assert connection.execute("SELECT COUNT(*) FROM session_events").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("kind,label", [("", "x"), ("x" * 65, "x"), ("start", "x" * 121)])
+def test_create_session_event_validates_kind_and_label_bounds(
+    tmp_path: Path, kind: str, label: str
+) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        session = _create_session(connection)
+        with pytest.raises(ValueError):
+            create_session_event(connection, session_id=str(session["id"]), kind=kind, label=label, timestamp=100.0)
     finally:
         connection.close()
