@@ -12,16 +12,16 @@ Muse 2 EEG collector, private receiver and dashboard. The receiver and dashboard
 
 Safe local-only verification for the signal-quality and sessions milestone:
 
-- `.venv/bin/pytest -q`
-- `python3 -m compileall -q services sources pipeline scripts sim.py ui.py`
-- `git diff --check`
-- PowerShell parser validation for `scripts/install_windows.ps1` with Docker, when available
+- `.venv/bin/pytest -q`: 178 passed.
+- `python3 -m compileall -q services sources pipeline scripts sim.py ui.py`: passed.
+- `git diff --check`: passed.
+- PowerShell parser validation for `scripts/install_windows.ps1` with Docker: passed.
 
 These checks cover repository integrity only. Live receiver/dashboard checks, physical Muse acceptance, SSH tunnel recovery, reboot validation, and deployment-side health probes remain a separate live gate.
 
 ## Rollback guidance
 
-- Stop deployment before replacing code.
+- Stop the receiver and every process that can write `data/history.db` before replacing code or taking the database backup.
 - Back up `data/history.db`, `data/history.db-wal`, and `data/history.db-shm` together.
 - Restore the prior Git commit and venv-compatible requirements.
 - Restart services and verify `/ready`, `/health`, and loopback bindings.

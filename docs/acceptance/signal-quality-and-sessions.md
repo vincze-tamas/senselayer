@@ -13,12 +13,12 @@ This document records what is safe to verify locally and what remains a live gat
 
 ## Completed safe local/static verification
 
-These checks are the safe local-only portion of Task 13:
+The Task 13 controller completed the safe local-only checks with these results:
 
-- `.venv/bin/pytest -q`
-- `python3 -m compileall -q services sources pipeline scripts sim.py ui.py`
-- `git diff --check`
-- PowerShell parser validation for `scripts/install_windows.ps1` using Docker, when Docker is available:
+- `.venv/bin/pytest -q`: 178 passed with one pre-existing third-party deprecation warning.
+- `python3 -m compileall -q services sources pipeline scripts sim.py ui.py`: passed.
+- `git diff --check`: passed.
+- PowerShell parser validation for `scripts/install_windows.ps1` using Docker: passed.
 
   ```bash
   docker run --rm -v "$PWD:/work:ro" mcr.microsoft.com/powershell:latest \
@@ -51,7 +51,7 @@ Run the real-Muse quality protocol exactly as follows:
 
 If the milestone must be reverted, use the following order:
 
-1. Stop deployment before replacing code.
+1. Stop the receiver and every process that can write `data/history.db` before replacing code or taking the database backup.
 2. Back up `data/history.db`, `data/history.db-wal`, and `data/history.db-shm` together.
 3. Restore the prior Git commit and the matching venv-compatible requirements.
 4. Restart services and verify `/ready`, `/health`, and loopback bindings.
