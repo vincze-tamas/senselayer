@@ -69,6 +69,28 @@ def test_waiting_ingest_history_and_fresh_health(monkeypatch, tmp_path):
     assert latest["source"] == "pytest-sim"
 
 
+def test_sample_endpoint_exposes_session_id_for_active_and_inactive_sessions(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 100.0)
+    created = client.post(
+        "/sessions",
+        json={"name": "baseline", "notes": "active", "source": "pytest-muse"},
+    ).json()
+
+    active_response = client.post("/sample", json=valid_sample())
+    assert active_response.status_code == 200
+    assert active_response.json()["session_id"] == created["id"]
+    assert client.get("/history").json()["items"][0]["session_id"] == created["id"]
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 150.0)
+    client.post(f"/sessions/{created['id']}/stop")
+    inactive_response = client.post("/sample", json=valid_sample())
+    assert inactive_response.json()["session_id"] is None
+    assert client.get("/history").json()["items"][-1]["session_id"] is None
+
+
 def test_receiver_closes_every_database_connection(monkeypatch, tmp_path):
     receiver = load_receiver(monkeypatch, tmp_path)
     connections = []

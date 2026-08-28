@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -152,6 +154,72 @@ def test_samples_attach_to_active_session_before_during_and_after_stop(tmp_path:
     assert [item["source"] for item in items] == ["before", "during", "after"]
     assert [item["session_id"] for item in items] == [None, session["id"], None]
     assert stored == [("before", None), ("during", session["id"]), ("after", None)]
+
+
+def test_insert_sample_reserves_the_active_session_boundary(tmp_path: Path) -> None:
+    database_path = tmp_path / "history.db"
+    connection = connect_database(database_path)
+    session = _create_session(connection)
+    connection.close()
+
+    begin_seen = threading.Event()
+    release = threading.Event()
+
+    class InterceptingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = (), /):  # type: ignore[override]
+            if sql == "BEGIN IMMEDIATE":
+                result = super().execute(sql, parameters)
+                begin_seen.set()
+                assert release.wait(timeout=5)
+                return result
+            return super().execute(sql, parameters)
+
+    ingest_connection = sqlite3.connect(
+        database_path, timeout=10, factory=InterceptingConnection, check_same_thread=False
+    )
+    stop_connection = sqlite3.connect(database_path, timeout=0.1, check_same_thread=False)
+    result: dict[str, Any] = {}
+    stop_error: list[BaseException] = []
+
+    def ingest() -> None:
+        result["sample"] = insert_sample(
+            ingest_connection,
+            _sample(9.0, 10.0, "boundary"),
+            max_history_rows=10,
+        )
+
+    def stop_session() -> None:
+        try:
+            stop_connection.execute(
+                "UPDATE sessions SET ended_at = ?, status = ? WHERE id = ? AND status = 'active'",
+                (200.0, "completed", session["id"]),
+            )
+            stop_connection.commit()
+        except BaseException as error:
+            stop_error.append(error)
+
+    worker = threading.Thread(target=ingest)
+    worker.start()
+    assert begin_seen.wait(timeout=5)
+
+    stopper = threading.Thread(target=stop_session)
+    stopper.start()
+    stopper.join(timeout=5)
+    release.set()
+    worker.join(timeout=5)
+
+    try:
+        assert worker.is_alive() is False
+        assert stopper.is_alive() is False
+        assert result["sample"]["session_id"] == session["id"]
+        assert stop_error and isinstance(stop_error[0], sqlite3.OperationalError)
+        stored = ingest_connection.execute(
+            "SELECT source, session_id FROM samples ORDER BY id"
+        ).fetchall()
+        assert stored == [("boundary", session["id"])]
+    finally:
+        ingest_connection.close()
+        stop_connection.close()
 
 
 def test_pruning_keeps_session_rows_and_drops_unassigned_rows(tmp_path: Path) -> None:

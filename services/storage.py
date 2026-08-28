@@ -246,7 +246,11 @@ def insert_sample(
         ),
     }
     values = tuple(stored_sample[column] for column in _SAMPLE_DB_COLUMNS)
-    with connection:
+    started_transaction = False
+    if not connection.in_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+        started_transaction = True
+    try:
         active_session = stored_sample["session_id"] or get_active_session(connection)
         if isinstance(active_session, dict):
             stored_sample["session_id"] = active_session["id"]
@@ -265,6 +269,12 @@ def insert_sample(
             "(SELECT id FROM samples WHERE session_id IS NULL ORDER BY id DESC LIMIT -1 OFFSET ?)",
             (max_history_rows,),
         )
+        if started_transaction:
+            connection.commit()
+    except BaseException:
+        if started_transaction and connection.in_transaction:
+            connection.rollback()
+        raise
     return stored_sample
 
 
