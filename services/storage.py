@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,18 @@ _SAMPLE_MIGRATION_COLUMNS = {
     "channel_quality_json": "TEXT",
     "artifact_flags_json": "TEXT",
 }
+
+_SESSION_COLUMNS = (
+    "id",
+    "name",
+    "notes",
+    "source",
+    "started_at",
+    "ended_at",
+    "status",
+    "software_version",
+    "created_at",
+)
 
 
 def connect_database(path: Path) -> sqlite3.Connection:
@@ -105,10 +118,107 @@ def migrate(connection: sqlite3.Connection) -> None:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_samples_received_at ON samples(received_at)"
         )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_session
+            ON sessions(status) WHERE status = 'active'
+            """
+        )
         connection.commit()
     except BaseException:
         connection.rollback()
         raise
+
+
+def _session_from_row(row: tuple[Any, ...] | sqlite3.Row) -> dict[str, Any]:
+    return dict(zip(_SESSION_COLUMNS, row, strict=True))
+
+
+def create_session(
+    connection: sqlite3.Connection,
+    *,
+    name: str,
+    notes: str,
+    source: str,
+    started_at: float,
+    software_version: str,
+    created_at: float,
+) -> dict[str, Any]:
+    session_id = str(uuid.uuid4())
+    values = (
+        session_id,
+        name,
+        notes,
+        source,
+        started_at,
+        None,
+        "active",
+        software_version,
+        created_at,
+    )
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO sessions(
+                id, name, notes, source, started_at, ended_at, status,
+                software_version, created_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?)
+            """,
+            values,
+        )
+    return dict(zip(_SESSION_COLUMNS, values, strict=True))
+
+
+def get_active_session(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    row = connection.execute(
+        f"SELECT {', '.join(_SESSION_COLUMNS)} FROM sessions WHERE status = 'active'"
+    ).fetchone()
+    return _session_from_row(row) if row is not None else None
+
+
+def list_sessions(connection: sqlite3.Connection, *, limit: int) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        f"SELECT {', '.join(_SESSION_COLUMNS)} "
+        "FROM sessions ORDER BY created_at DESC, id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [_session_from_row(row) for row in rows]
+
+
+def get_session(connection: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
+    row = connection.execute(
+        f"SELECT {', '.join(_SESSION_COLUMNS)} FROM sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    return _session_from_row(row) if row is not None else None
+
+
+def _finish_session(
+    connection: sqlite3.Connection,
+    session_id: str,
+    *,
+    ended_at: float,
+    status: str,
+) -> dict[str, Any] | None:
+    with connection:
+        connection.execute(
+            "UPDATE sessions SET ended_at = ?, status = ? WHERE id = ? AND status = 'active'",
+            (ended_at, status, session_id),
+        )
+    return get_session(connection, session_id)
+
+
+def complete_session(
+    connection: sqlite3.Connection, session_id: str, *, ended_at: float
+) -> dict[str, Any] | None:
+    return _finish_session(connection, session_id, ended_at=ended_at, status="completed")
+
+
+def abort_session(
+    connection: sqlite3.Connection, session_id: str, *, ended_at: float
+) -> dict[str, Any] | None:
+    return _finish_session(connection, session_id, ended_at=ended_at, status="aborted")
 
 
 def insert_sample(

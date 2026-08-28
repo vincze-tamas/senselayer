@@ -1,9 +1,23 @@
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from pathlib import Path
 
-from services.storage import connect_database, fetch_sample_history, insert_sample, migrate
+import pytest
+
+from services.storage import (
+    abort_session,
+    complete_session,
+    connect_database,
+    create_session,
+    fetch_sample_history,
+    get_active_session,
+    get_session,
+    insert_sample,
+    list_sessions,
+    migrate,
+)
 
 
 LEGACY_SCHEMA = """
@@ -112,3 +126,107 @@ def test_sample_storage_round_trip_and_pruning(tmp_path: Path) -> None:
 
     assert [item["source"] for item in items] == ["second"]
     assert items[0]["alpha"] == 0.3
+
+
+def _create_session(
+    connection: sqlite3.Connection,
+    *,
+    name: str = "baseline",
+    created_at: float = 101.0,
+) -> dict[str, object]:
+    return create_session(
+        connection,
+        name=name,
+        notes="eyes open",
+        source="muse2-edge",
+        started_at=100.0,
+        software_version="2.0.0",
+        created_at=created_at,
+    )
+
+
+def test_create_session_round_trip_and_listing(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        created = _create_session(connection)
+        session_id = str(created["id"])
+
+        assert str(uuid.UUID(session_id)) == session_id
+        assert created == {
+            "id": session_id,
+            "name": "baseline",
+            "notes": "eyes open",
+            "source": "muse2-edge",
+            "started_at": 100.0,
+            "ended_at": None,
+            "status": "active",
+            "software_version": "2.0.0",
+            "created_at": 101.0,
+        }
+        assert get_active_session(connection) == created
+        assert get_session(connection, session_id) == created
+        assert list_sessions(connection, limit=10) == [created]
+        assert any(
+            row[1] == "idx_one_active_session" and row[2] == 1 and row[4] == 1
+            for row in connection.execute("PRAGMA index_list(sessions)")
+        )
+    finally:
+        connection.close()
+
+
+def test_create_session_rejects_second_active_session(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        _create_session(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            _create_session(connection, name="conflict")
+        assert get_active_session(connection)["name"] == "baseline"
+    finally:
+        connection.close()
+
+
+def test_complete_session_is_idempotent(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        created = _create_session(connection)
+        completed = complete_session(connection, str(created["id"]), ended_at=150.0)
+        repeated = complete_session(connection, str(created["id"]), ended_at=999.0)
+
+        assert completed is not None
+        assert completed["status"] == "completed"
+        assert completed["ended_at"] == 150.0
+        assert repeated == completed
+        assert get_active_session(connection) is None
+    finally:
+        connection.close()
+
+
+def test_abort_session_closes_active_session_and_allows_reopen(tmp_path: Path) -> None:
+    database_path = tmp_path / "history.db"
+    connection = connect_database(database_path)
+    created = _create_session(connection)
+    connection.close()
+
+    reopened = connect_database(database_path)
+    try:
+        assert get_active_session(reopened) == created
+        aborted = abort_session(reopened, str(created["id"]), ended_at=160.0)
+        replacement = _create_session(reopened, name="replacement", created_at=102.0)
+
+        assert aborted is not None
+        assert aborted["status"] == "aborted"
+        assert aborted["ended_at"] == 160.0
+        assert get_active_session(reopened) == replacement
+        assert [item["name"] for item in list_sessions(reopened, limit=1)] == ["replacement"]
+    finally:
+        reopened.close()
+
+
+def test_session_transitions_return_none_for_unknown_id(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        assert get_session(connection, "missing") is None
+        assert complete_session(connection, "missing", ended_at=150.0) is None
+        assert abort_session(connection, "missing", ended_at=150.0) is None
+    finally:
+        connection.close()
