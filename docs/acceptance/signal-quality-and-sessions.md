@@ -38,8 +38,14 @@ The following checks remain outside the safe local-only scope and must be run on
 - Muse reconnect remains healthy.
 - Network reconnect remains healthy.
 - Windows reboot auto-start remains healthy.
-- Real Muse quality transitions appear in exported session data.
-- No derived State/Focus output appears during bad quality.
+
+Run the real-Muse quality protocol exactly as follows:
+
+1. Record 30 seconds with the Muse worn correctly.
+2. Remove one electrode for 20 seconds.
+3. Restore the electrode for 30 seconds.
+4. Confirm quality worsens and then recovers, with both transitions present in exported session data.
+5. Confirm no derived State/Focus output appears during bad quality.
 
 ## Rollback guidance
 
