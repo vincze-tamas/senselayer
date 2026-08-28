@@ -8,11 +8,20 @@ import time
 from contextlib import closing
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from uuid import UUID
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
-from services.storage import connect_database, fetch_sample_history, insert_sample
+from services.storage import (
+    complete_session,
+    connect_database,
+    create_session,
+    fetch_sample_history,
+    get_session,
+    insert_sample,
+    list_sessions,
+)
 
 BANDS = ("delta", "theta", "alpha", "beta", "gamma")
 CHANNELS = frozenset(("TP9", "AF7", "AF8", "TP10"))
@@ -26,6 +35,30 @@ app = FastAPI(title="SenseLayer Muse Receiver", version="2.0.0")
 
 QualityScore = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
 ArtifactFlag = Annotated[str, Field(min_length=1, max_length=64)]
+SessionListLimit = Annotated[int, Query(ge=1, le=1000)]
+
+
+class SessionStart(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    notes: str = Field(default="", max_length=4000)
+    source: str = Field(default="muse2-edge", min_length=1, max_length=100)
+
+
+class SessionResponse(BaseModel):
+    id: UUID
+    name: str = Field(min_length=1, max_length=120)
+    notes: str = Field(max_length=4000)
+    source: str = Field(min_length=1, max_length=100)
+    started_at: float = Field(allow_inf_nan=False)
+    ended_at: float | None = Field(default=None, allow_inf_nan=False)
+    status: Literal["active", "completed", "aborted"]
+    software_version: str = Field(min_length=1, max_length=100)
+    created_at: float = Field(allow_inf_nan=False)
+
+
+class SessionListResponse(BaseModel):
+    count: int = Field(ge=0)
+    items: list[SessionResponse]
 
 
 class Sample(BaseModel):
@@ -113,6 +146,51 @@ def history(limit: int = 300) -> dict[str, Any]:
     with closing(_connect()) as connection:
         items = fetch_sample_history(connection, limit=bounded_limit)
     return {"ok": True, "count": len(items), "items": items}
+
+
+@app.post("/sessions", response_model=SessionResponse, status_code=201)
+def start_session(request: SessionStart) -> dict[str, Any]:
+    now = time.time()
+    with closing(_connect()) as connection:
+        try:
+            return create_session(
+                connection,
+                name=request.name,
+                notes=request.notes,
+                source=request.source,
+                started_at=now,
+                software_version=app.version,
+                created_at=now,
+            )
+        except sqlite3.IntegrityError as error:
+            raise HTTPException(
+                status_code=409, detail="an active session already exists"
+            ) from error
+
+
+@app.get("/sessions", response_model=SessionListResponse)
+def sessions(limit: SessionListLimit = 100) -> dict[str, Any]:
+    with closing(_connect()) as connection:
+        items = list_sessions(connection, limit=limit)
+    return {"count": len(items), "items": items}
+
+
+@app.get("/sessions/{session_id}", response_model=SessionResponse)
+def session_detail(session_id: str) -> dict[str, Any]:
+    with closing(_connect()) as connection:
+        session = get_session(connection, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return session
+
+
+@app.post("/sessions/{session_id}/stop", response_model=SessionResponse)
+def stop_session(session_id: str) -> dict[str, Any]:
+    with closing(_connect()) as connection:
+        session = complete_session(connection, session_id, ended_at=time.time())
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return session
 
 
 @app.post("/sample")

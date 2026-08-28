@@ -3,6 +3,7 @@ import json
 import sqlite3
 import sys
 import time
+import uuid
 from contextlib import closing
 from pathlib import Path
 
@@ -184,3 +185,81 @@ def test_rejects_oversized_artifact_lists(monkeypatch, tmp_path):
     payload["artifact_flags"] = [f"artifact_{index}" for index in range(17)]
 
     assert TestClient(receiver.app).post("/sample", json=payload).status_code == 422
+
+
+def test_session_lifecycle_success_and_idempotent_stop(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    monkeypatch.setattr(receiver.time, "time", lambda: 100.0)
+    client = TestClient(receiver.app)
+
+    response = client.post(
+        "/sessions",
+        json={"name": "eyes open", "notes": "baseline", "source": "pytest-muse"},
+    )
+
+    assert response.status_code == 201
+    created = response.json()
+    session_id = created["id"]
+    assert str(uuid.UUID(session_id)) == session_id
+    assert created == {
+        "id": session_id,
+        "name": "eyes open",
+        "notes": "baseline",
+        "source": "pytest-muse",
+        "started_at": 100.0,
+        "ended_at": None,
+        "status": "active",
+        "software_version": "2.0.0",
+        "created_at": 100.0,
+    }
+    assert client.get(f"/sessions/{session_id}").json() == created
+    assert client.get("/sessions").json() == {"count": 1, "items": [created]}
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 150.0)
+    stopped = client.post(f"/sessions/{session_id}/stop")
+    assert stopped.status_code == 200
+    assert stopped.json() == {**created, "ended_at": 150.0, "status": "completed"}
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 999.0)
+    assert client.post(f"/sessions/{session_id}/stop").json() == stopped.json()
+
+
+def test_session_start_conflict_returns_409(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    assert client.post("/sessions", json={"name": "first"}).status_code == 201
+    response = client.post("/sessions", json={"name": "second"})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "an active session already exists"
+
+
+def test_missing_session_detail_and_stop_return_404(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    assert client.get("/sessions/missing").status_code == 404
+    assert client.post("/sessions/missing/stop").status_code == 404
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"name": ""},
+        {"name": "x" * 121},
+        {"name": "valid", "notes": "x" * 4001},
+        {"name": "valid", "source": ""},
+    ],
+)
+def test_session_start_validation_returns_422(monkeypatch, tmp_path, payload):
+    receiver = load_receiver(monkeypatch, tmp_path)
+
+    assert TestClient(receiver.app).post("/sessions", json=payload).status_code == 422
+
+
+@pytest.mark.parametrize("limit", [0, 1001])
+def test_session_list_limit_validation_returns_422(monkeypatch, tmp_path, limit):
+    receiver = load_receiver(monkeypatch, tmp_path)
+
+    assert TestClient(receiver.app).get(f"/sessions?limit={limit}").status_code == 422
