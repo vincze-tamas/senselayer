@@ -7,3 +7,4 @@
 - Add a supervised Muse 2/LSL collector with automatic tunnel, BLE and stream recovery.
 - Add an idempotent Windows 11 installer, pinned SSH host-key verification, Task Scheduler autostart and safe rollback.
 - Add simulated edge mode, receiver validation, SQLite WAL operation and automated tests.
+- Add the staged product roadmap and implementation plan for signal quality and replayable sessions.

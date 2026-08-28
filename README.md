@@ -2,6 +2,11 @@
 
 Muse 2 EEG collector, private receiver and dashboard. The receiver and dashboard are intentionally loopback-only on `dn-dev-01`; Windows reaches them through a pinned-host-key SSH tunnel.
 
+## Roadmap
+
+- [Product roadmap](docs/ROADMAP.md)
+- [Signal quality and replayable sessions implementation plan](docs/plans/2026-08-28-signal-quality-and-sessions.md)
+
 ## Security model
 
 - Server listeners: `127.0.0.1:8787` and `127.0.0.1:8501` only.
