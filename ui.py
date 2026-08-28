@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import time
+from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -17,6 +18,7 @@ from pipeline.eeg_quality import (
     MARGINAL_SCORE_THRESHOLD,
 )
 from sim import Muse2Simulator, load_config
+from services.client import ReceiverClient, ReceiverClientError
 from sources.live_source import LiveFileSource
 
 LABELS = {"delta": "Delta", "theta": "Theta", "alpha": "Alpha", "beta": "Beta", "gamma": "Gamma"}
@@ -40,6 +42,42 @@ KNOWN_ARTIFACT_FLAGS = frozenset(
         "channel_outlier",
     }
 )
+STANDARD_SESSION_MARKERS = (
+    ("Eyes open", "eyes_open"),
+    ("Eyes closed", "eyes_closed"),
+    ("Breathing", "breathing"),
+    ("Task start", "task_start"),
+)
+
+
+@dataclass(frozen=True)
+class SessionActionState:
+    active_session: dict[str, Any] | None
+    start_disabled: bool
+    active_actions_disabled: bool
+
+
+def session_action_state(sessions: list[dict[str, Any]]) -> SessionActionState:
+    active_session = next((item for item in sessions if item.get("status") == "active"), None)
+    return SessionActionState(
+        active_session=active_session,
+        start_disabled=active_session is not None,
+        active_actions_disabled=active_session is None,
+    )
+
+
+def load_dashboard_sessions(client: Any) -> tuple[list[dict[str, Any]], str | None]:
+    try:
+        return client.list_sessions(limit=20), None
+    except ReceiverClientError as error:
+        return [], str(error)
+
+
+def format_session_timestamp(value: object) -> str:
+    timestamp = strict_float(value)
+    if timestamp is None:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(timestamp))
 
 
 def normalized_quality_label(label: object) -> str:
@@ -269,9 +307,174 @@ def render_history() -> None:
         )
 
 
-def main() -> None:
-    st.set_page_config(page_title="BCI Simulator", page_icon="🧠", layout="wide")
-    st.title("🧠 BCI Live + History")
+def _finish_session_action(message: str) -> None:
+    st.session_state.pop("session_csv_download", None)
+    st.session_state["session_action_message"] = message
+    st.rerun()
+
+
+def _display_session_action_message() -> None:
+    message = st.session_state.pop("session_action_message", None)
+    if message:
+        st.success(message)
+
+
+def render_session_controls(client: ReceiverClient | None = None) -> None:
+    client = client or ReceiverClient()
+    st.divider()
+    st.header("Measurement sessions")
+    _display_session_action_message()
+
+    sessions, error = load_dashboard_sessions(client)
+    if error is not None:
+        st.error(error)
+        return
+
+    state = session_action_state(sessions)
+    active = state.active_session
+    if active is None:
+        st.info("No active measurement session.")
+    else:
+        st.success(f"Active: {active.get('name', 'Unnamed session')}")
+
+    name = st.text_input(
+        "Session name",
+        max_chars=120,
+        disabled=state.start_disabled,
+        placeholder="e.g. Eyes-open baseline",
+    )
+    notes = st.text_area(
+        "Session notes",
+        max_chars=4000,
+        disabled=state.start_disabled,
+        placeholder="Optional protocol notes",
+    )
+    start_column, stop_column = st.columns(2)
+    if start_column.button(
+        "Start session",
+        type="primary",
+        disabled=state.start_disabled or not name.strip(),
+        use_container_width=True,
+    ):
+        try:
+            client.start_session(name.strip(), notes.strip())
+        except ReceiverClientError as action_error:
+            st.error(str(action_error))
+        else:
+            _finish_session_action("Measurement session started.")
+
+    active_id = str(active["id"]) if active is not None else ""
+    if stop_column.button(
+        "Stop session",
+        disabled=state.active_actions_disabled,
+        use_container_width=True,
+    ):
+        try:
+            client.stop_session(active_id)
+        except ReceiverClientError as action_error:
+            st.error(str(action_error))
+        else:
+            _finish_session_action("Measurement session stopped.")
+
+    st.subheader("Event markers")
+    marker_columns = st.columns(len(STANDARD_SESSION_MARKERS))
+    for column, (label, kind) in zip(marker_columns, STANDARD_SESSION_MARKERS):
+        if column.button(
+            label,
+            key=f"session_marker_{kind}",
+            disabled=state.active_actions_disabled,
+            use_container_width=True,
+        ):
+            try:
+                client.add_event(active_id, kind)
+            except ReceiverClientError as action_error:
+                st.error(str(action_error))
+            else:
+                _finish_session_action(f"Marker added: {label}.")
+
+    marker_text = st.text_input(
+        "Free-text marker",
+        max_chars=120,
+        disabled=state.active_actions_disabled,
+        placeholder="What happened?",
+    )
+    if st.button(
+        "Add note marker",
+        disabled=state.active_actions_disabled or not marker_text.strip(),
+    ):
+        try:
+            client.add_event(active_id, "note", marker_text.strip())
+        except ReceiverClientError as action_error:
+            st.error(str(action_error))
+        else:
+            _finish_session_action("Note marker added.")
+
+    st.subheader("Recent sessions")
+    if not sessions:
+        st.caption("No saved sessions yet.")
+        return
+
+    rows = [
+        {
+            "Name": item.get("name", ""),
+            "Status": item.get("status", ""),
+            "Started (UTC)": format_session_timestamp(item.get("started_at")),
+            "Ended (UTC)": format_session_timestamp(item.get("ended_at")),
+        }
+        for item in sessions
+    ]
+    st.dataframe(rows, hide_index=True, use_container_width=True)
+
+    session_labels = {
+        str(item["id"]): f"{item.get('name', 'Unnamed')} · {item.get('status', 'unknown')}"
+        for item in sessions
+    }
+    selected_id = st.selectbox(
+        "Session to download",
+        options=list(session_labels),
+        format_func=lambda session_id: session_labels[str(session_id)],
+    )
+    if st.button("Prepare CSV downloads"):
+        try:
+            samples_csv = client.download_samples_csv(selected_id)
+            events_csv = client.download_events_csv(selected_id)
+        except ReceiverClientError as action_error:
+            st.error(str(action_error))
+        else:
+            st.session_state["session_csv_download"] = {
+                "id": selected_id,
+                "samples": samples_csv,
+                "events": events_csv,
+            }
+
+    prepared = st.session_state.get("session_csv_download")
+    if isinstance(prepared, dict) and prepared.get("id") == selected_id:
+        download_columns = st.columns(2)
+        download_columns[0].download_button(
+            "Download samples CSV",
+            data=prepared["samples"],
+            file_name=f"session-{selected_id}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        download_columns[1].download_button(
+            "Download events CSV",
+            data=prepared["events"],
+            file_name=f"session-{selected_id}-events.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+
+def _live_fragment(function: Callable[[], None]) -> Callable[[], None]:
+    fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+    if fragment is None:
+        return function
+    return fragment(run_every=2)(function)
+
+
+@_live_fragment
+def render_live_dashboard() -> None:
     live_sample = LiveFileSource().next()
     sample, source_name = resolve_dashboard_sample(
         live_sample,
@@ -284,12 +487,14 @@ def main() -> None:
         render_current_sample(sample, source_name)
 
     render_history()
+
+
+def main() -> None:
+    st.set_page_config(page_title="BCI Simulator", page_icon="🧠", layout="wide")
+    st.title("🧠 BCI Live + History")
+    render_live_dashboard()
+    render_session_controls()
     st.caption("Auto refresh 2s")
-    time.sleep(2)
-    if hasattr(st, "rerun"):
-        st.rerun()
-    else:
-        st.experimental_rerun()
 
 
 if __name__ == "__main__":
