@@ -1,0 +1,60 @@
+# Signal Quality and Sessions Acceptance
+
+Task 13 documents the regression, deployment, and real-Muse acceptance gate for the signal-quality and replayable-sessions milestone.
+
+## Scope
+
+This milestone is validated in two parts:
+
+- **Completed safe local/static verification**: repository-only checks that can run without hardware, live services, SSH, or deployment.
+- **Not run here**: live receiver/dashboard health probes, physical Muse 2 runs, SSH tunnel checks, Windows reboot checks, and any deployment-side runtime validation.
+
+This document records what is safe to verify locally and what remains a live gate.
+
+## Completed safe local/static verification
+
+These checks are the safe local-only portion of Task 13:
+
+- `.venv/bin/pytest -q`
+- `python3 -m compileall -q services sources pipeline scripts sim.py ui.py`
+- `git diff --check`
+- PowerShell parser validation for `scripts/install_windows.ps1` using Docker, when Docker is available:
+
+  ```bash
+  docker run --rm -v "$PWD:/work:ro" mcr.microsoft.com/powershell:latest \
+    pwsh -NoProfile -Command '[System.Management.Automation.Language.Parser]::ParseFile("/work/scripts/install_windows.ps1",[ref]$null,[ref]$null) | Out-Null'
+  ```
+
+If any of these fail, fix the repository before moving to the live gate.
+
+## Not run here: live / physical acceptance gates
+
+The following checks remain outside the safe local-only scope and must be run only in the live environment with the real deployment and Muse hardware:
+
+- Receiver and dashboard stay enabled and active.
+- Listeners remain bound only to `127.0.0.1:8787` and `127.0.0.1:8501`.
+- Existing `history.db` migrates without row loss.
+- SSH tunnel recovery remains healthy.
+- Muse reconnect remains healthy.
+- Network reconnect remains healthy.
+- Windows reboot auto-start remains healthy.
+- Real Muse quality transitions appear in exported session data.
+- No derived State/Focus output appears during bad quality.
+
+## Rollback guidance
+
+If the milestone must be reverted, use the following order:
+
+1. Stop deployment before replacing code.
+2. Back up `data/history.db`, `data/history.db-wal`, and `data/history.db-shm` together.
+3. Restore the prior Git commit and the matching venv-compatible requirements.
+4. Restart services and verify `/ready`, `/health`, and loopback bindings.
+5. Never roll back by deleting or recreating the migrated database.
+
+## Acceptance intent
+
+The milestone is acceptable only when:
+
+- the safe local/static checks pass,
+- the live runtime gates pass in the deployed environment,
+- and the rollback path is known to preserve the migrated SQLite database.
