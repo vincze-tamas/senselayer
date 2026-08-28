@@ -57,12 +57,14 @@ def test_waiting_ingest_history_and_fresh_health(monkeypatch, tmp_path):
 
     response = client.post("/sample", json=valid_sample())
     assert response.status_code == 200
+    assert response.json()["session_id"] is None
     health = client.get("/health").json()
     assert health["status"] == "fresh"
     assert health["source"] == "pytest-sim"
     history = client.get("/history?limit=10").json()
     assert history["count"] == 1
     assert history["items"][0]["alpha"] == pytest.approx(0.3)
+    assert history["items"][0]["session_id"] is None
     latest = json.loads(receiver.LATEST_PATH.read_text(encoding="utf-8"))
     assert latest["source"] == "pytest-sim"
 

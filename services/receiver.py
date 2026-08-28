@@ -199,7 +199,11 @@ def ingest_sample(sample: Sample) -> dict[str, Any]:
     now = time.time()
     payload["received_at"] = now
     with closing(_connect()) as connection:
-        insert_sample(connection, payload, max_history_rows=MAX_HISTORY_ROWS)
-    _atomic_write(LATEST_PATH, payload)
-    _atomic_write(HEALTH_PATH, {"updated": now, "source": payload["source"]})
-    return {"ok": True, "received_at": now}
+        stored_sample = insert_sample(connection, payload, max_history_rows=MAX_HISTORY_ROWS)
+    _atomic_write(LATEST_PATH, stored_sample)
+    _atomic_write(HEALTH_PATH, {"updated": now, "source": stored_sample["source"]})
+    return {
+        "ok": True,
+        "received_at": now,
+        "session_id": stored_sample["session_id"],
+    }

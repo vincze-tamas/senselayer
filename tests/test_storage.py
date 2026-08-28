@@ -128,6 +128,60 @@ def test_sample_storage_round_trip_and_pruning(tmp_path: Path) -> None:
     assert items[0]["alpha"] == 0.3
 
 
+def test_samples_attach_to_active_session_before_during_and_after_stop(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        before = _sample(0.5, 0.6, "before")
+        insert_sample(connection, before, max_history_rows=10)
+
+        session = _create_session(connection)
+        insert_sample(connection, _sample(1.0, 2.0, "during"), max_history_rows=10)
+
+        completed = complete_session(connection, str(session["id"]), ended_at=150.0)
+        assert completed is not None
+
+        insert_sample(connection, _sample(3.0, 4.0, "after"), max_history_rows=10)
+
+        items = fetch_sample_history(connection, limit=10)
+        stored = connection.execute(
+            "SELECT source, session_id FROM samples ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert [item["source"] for item in items] == ["before", "during", "after"]
+    assert [item["session_id"] for item in items] == [None, session["id"], None]
+    assert stored == [("before", None), ("during", session["id"]), ("after", None)]
+
+
+def test_pruning_keeps_session_rows_and_drops_unassigned_rows(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        insert_sample(connection, _sample(1.0, 2.0, "before-1"), max_history_rows=2)
+        insert_sample(connection, _sample(2.0, 3.0, "before-2"), max_history_rows=2)
+
+        session = _create_session(connection)
+        insert_sample(connection, _sample(3.0, 4.0, "attached"), max_history_rows=2)
+        complete_session(connection, str(session["id"]), ended_at=150.0)
+        insert_sample(connection, _sample(4.0, 5.0, "after-1"), max_history_rows=2)
+        insert_sample(connection, _sample(5.0, 6.0, "after-2"), max_history_rows=2)
+
+        items = fetch_sample_history(connection, limit=10)
+        stored = connection.execute(
+            "SELECT source, session_id FROM samples ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert [item["source"] for item in items] == ["attached", "after-1", "after-2"]
+    assert [item["session_id"] for item in items] == [session["id"], None, None]
+    assert stored == [
+        ("attached", session["id"]),
+        ("after-1", None),
+        ("after-2", None),
+    ]
+
+
 def _create_session(
     connection: sqlite3.Connection,
     *,

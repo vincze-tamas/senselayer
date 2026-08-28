@@ -20,6 +20,7 @@ _SAMPLE_COLUMNS = (
 )
 
 _SAMPLE_DB_COLUMNS = _SAMPLE_COLUMNS + (
+    "session_id",
     "quality_label",
     "channel_quality_json",
     "artifact_flags_json",
@@ -31,6 +32,12 @@ _SAMPLE_MIGRATION_COLUMNS = {
     "channel_quality_json": "TEXT",
     "artifact_flags_json": "TEXT",
 }
+
+
+def _normalise_session_id(session_id: Any) -> str | None:
+    if session_id is None or session_id == "":
+        return None
+    return str(session_id)
 
 _SESSION_COLUMNS = (
     "id",
@@ -226,9 +233,10 @@ def insert_sample(
     sample: Mapping[str, Any],
     *,
     max_history_rows: int,
-) -> None:
+) -> dict[str, Any]:
     stored_sample = {
         **sample,
+        "session_id": _normalise_session_id(sample.get("session_id")),
         "quality_label": sample.get("quality_label", "unknown"),
         "channel_quality_json": json.dumps(
             sample.get("channel_quality", {}), sort_keys=True, separators=(",", ":")
@@ -239,28 +247,32 @@ def insert_sample(
     }
     values = tuple(stored_sample[column] for column in _SAMPLE_DB_COLUMNS)
     with connection:
+        active_session = stored_sample["session_id"] or get_active_session(connection)
+        if isinstance(active_session, dict):
+            stored_sample["session_id"] = active_session["id"]
         connection.execute(
             """
             INSERT INTO samples(
                 timestamp, received_at, source, delta, theta, alpha, beta, gamma,
-                signal_quality, quality_label, channel_quality_json, artifact_flags_json
+                signal_quality, session_id, quality_label, channel_quality_json, artifact_flags_json
             )
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            values,
+            tuple(stored_sample[column] for column in _SAMPLE_DB_COLUMNS),
         )
         connection.execute(
             "DELETE FROM samples WHERE id IN "
-            "(SELECT id FROM samples ORDER BY id DESC LIMIT -1 OFFSET ?)",
+            "(SELECT id FROM samples WHERE session_id IS NULL ORDER BY id DESC LIMIT -1 OFFSET ?)",
             (max_history_rows,),
         )
+    return stored_sample
 
 
 def fetch_sample_history(connection: sqlite3.Connection, *, limit: int) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
         SELECT timestamp, received_at, source, delta, theta, alpha, beta, gamma,
-               signal_quality, quality_label, channel_quality_json, artifact_flags_json
+               signal_quality, session_id, quality_label, channel_quality_json, artifact_flags_json
         FROM samples ORDER BY id DESC LIMIT ?
         """,
         (limit,),
@@ -271,6 +283,7 @@ def fetch_sample_history(connection: sqlite3.Connection, *, limit: int) -> list[
         channel_quality_json = stored.pop("channel_quality_json")
         artifact_flags_json = stored.pop("artifact_flags_json")
         stored["quality_label"] = stored["quality_label"] or "unknown"
+        stored["session_id"] = _normalise_session_id(stored["session_id"])
         stored["channel_quality"] = (
             json.loads(channel_quality_json) if channel_quality_json is not None else {}
         )
