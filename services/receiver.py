@@ -5,11 +5,14 @@ import math
 import os
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+from services.storage import connect_database, fetch_sample_history, insert_sample
 
 BANDS = ("delta", "theta", "alpha", "beta", "gamma")
 DATA_DIR = Path(os.environ.get("SENSELAYER_DATA_DIR", "data"))
@@ -33,29 +36,7 @@ class Sample(BaseModel):
 
 
 def _connect() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DB_PATH, timeout=10)
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA busy_timeout=10000")
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS samples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            received_at REAL NOT NULL,
-            source TEXT NOT NULL,
-            delta REAL NOT NULL,
-            theta REAL NOT NULL,
-            alpha REAL NOT NULL,
-            beta REAL NOT NULL,
-            gamma REAL NOT NULL,
-            signal_quality REAL NOT NULL
-        )
-        """
-    )
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_samples_received_at ON samples(received_at)")
-    connection.commit()
-    return connection
+    return connect_database(DB_PATH)
 
 
 def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
@@ -86,7 +67,7 @@ def _validated_payload(sample: Sample) -> dict[str, Any]:
 
 @app.get("/ready")
 def ready() -> dict[str, Any]:
-    with _connect() as connection:
+    with closing(_connect()) as connection:
         connection.execute("SELECT 1").fetchone()
     return {"ok": True}
 
@@ -114,22 +95,8 @@ def health() -> dict[str, Any]:
 @app.get("/history")
 def history(limit: int = 300) -> dict[str, Any]:
     bounded_limit = max(1, min(limit, 5000))
-    with _connect() as connection:
-        rows = connection.execute(
-            """
-            SELECT timestamp, received_at, source, delta, theta, alpha, beta, gamma, signal_quality
-            FROM samples ORDER BY id DESC LIMIT ?
-            """,
-            (bounded_limit,),
-        ).fetchall()
-    items = [
-        {
-            "timestamp": row[0], "received_at": row[1], "source": row[2],
-            "delta": row[3], "theta": row[4], "alpha": row[5], "beta": row[6],
-            "gamma": row[7], "signal_quality": row[8],
-        }
-        for row in reversed(rows)
-    ]
+    with closing(_connect()) as connection:
+        items = fetch_sample_history(connection, limit=bounded_limit)
     return {"ok": True, "count": len(items), "items": items}
 
 
@@ -138,24 +105,8 @@ def ingest_sample(sample: Sample) -> dict[str, Any]:
     payload = _validated_payload(sample)
     now = time.time()
     payload["received_at"] = now
-    with _connect() as connection:
-        connection.execute(
-            """
-            INSERT INTO samples(timestamp, received_at, source, delta, theta, alpha, beta, gamma, signal_quality)
-            VALUES(?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                float(payload["timestamp"]), now, str(payload["source"]),
-                *(float(payload[band]) for band in BANDS),
-                float(payload["signal_quality"]),
-            ),
-        )
-        connection.execute(
-            "DELETE FROM samples WHERE id IN "
-            "(SELECT id FROM samples ORDER BY id DESC LIMIT -1 OFFSET ?)",
-            (MAX_HISTORY_ROWS,),
-        )
-        connection.commit()
+    with closing(_connect()) as connection:
+        insert_sample(connection, payload, max_history_rows=MAX_HISTORY_ROWS)
     _atomic_write(LATEST_PATH, payload)
     _atomic_write(HEALTH_PATH, {"updated": now, "source": payload["source"]})
     return {"ok": True, "received_at": now}

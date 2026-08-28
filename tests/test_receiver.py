@@ -1,7 +1,9 @@
 import importlib
 import json
+import sqlite3
 import sys
 import time
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -31,6 +33,10 @@ def test_waiting_ingest_history_and_fresh_health(monkeypatch, tmp_path):
     receiver = load_receiver(monkeypatch, tmp_path)
     client = TestClient(receiver.app)
     assert client.get("/ready").json() == {"ok": True}
+    with closing(receiver._connect()) as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 10_000
     assert client.get("/health").json()["status"] == "waiting_for_samples"
 
     response = client.post("/sample", json=valid_sample())
@@ -43,6 +49,33 @@ def test_waiting_ingest_history_and_fresh_health(monkeypatch, tmp_path):
     assert history["items"][0]["alpha"] == pytest.approx(0.3)
     latest = json.loads(receiver.LATEST_PATH.read_text(encoding="utf-8"))
     assert latest["source"] == "pytest-sim"
+
+
+def test_receiver_closes_every_database_connection(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    connections = []
+    original_connect = sqlite3.connect
+
+    class TrackingConnection(sqlite3.Connection):
+        was_closed = False
+
+        def close(self):
+            self.was_closed = True
+            super().close()
+
+    def tracked_connect(*args, **kwargs):
+        connection = original_connect(*args, factory=TrackingConnection, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr("services.storage.sqlite3.connect", tracked_connect)
+    client = TestClient(receiver.app)
+    assert client.get("/ready").status_code == 200
+    assert client.get("/history").status_code == 200
+    assert client.post("/sample", json=valid_sample()).status_code == 200
+
+    assert len(connections) == 3
+    assert all(connection.was_closed for connection in connections)
 
 
 @pytest.mark.parametrize(
