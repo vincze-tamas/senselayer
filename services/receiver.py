@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import math
 import os
 import sqlite3
 import time
+from collections.abc import AsyncIterator, Generator, Iterable, Iterator
 from contextlib import closing
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+from starlette.concurrency import iterate_in_threadpool
 
 from services.storage import (
     complete_session,
@@ -19,8 +24,11 @@ from services.storage import (
     create_session,
     create_session_event,
     fetch_sample_history,
+    fetch_session_samples,
     get_session,
     insert_sample,
+    iter_session_event_export_rows,
+    iter_session_sample_export_rows,
     list_session_events,
     list_sessions,
 )
@@ -38,6 +46,13 @@ app = FastAPI(title="SenseLayer Muse Receiver", version="2.0.0")
 QualityScore = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
 ArtifactFlag = Annotated[str, Field(min_length=1, max_length=64)]
 SessionListLimit = Annotated[int, Query(ge=1, le=1000)]
+SessionSampleLimit = Annotated[int, Query(ge=1, le=5000)]
+
+SAMPLE_CSV_COLUMNS = (
+    "session_id", "timestamp", "received_at", "source", "delta", "theta", "alpha", "beta",
+    "gamma", "signal_quality", "quality_label", "channel_quality_json", "artifact_flags_json",
+)
+EVENT_CSV_COLUMNS = ("session_id", "event_id", "timestamp", "kind", "label")
 
 
 class SessionStart(BaseModel):
@@ -112,8 +127,8 @@ class Sample(BaseModel):
         return value
 
 
-def _connect() -> sqlite3.Connection:
-    return connect_database(DB_PATH)
+def _connect(*, check_same_thread: bool = True) -> sqlite3.Connection:
+    return connect_database(DB_PATH, check_same_thread=check_same_thread)
 
 
 def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
@@ -161,6 +176,42 @@ def _session_event_payload(connection: sqlite3.Connection, session_id: str, even
         raise HTTPException(status_code=409, detail=str(error)) from error
     except LookupError as error:
         raise HTTPException(status_code=404, detail="session not found") from error
+
+
+def _csv_lines(header: tuple[str, ...], rows: Iterable[tuple[Any, ...]]) -> Iterator[str]:
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(header)
+    yield output.getvalue()
+    for row in rows:
+        output.seek(0)
+        output.truncate(0)
+        writer.writerow(row)
+        yield output.getvalue()
+
+
+def _sample_csv(session_id: str) -> Generator[str, None, None]:
+    with closing(_connect(check_same_thread=False)) as connection:
+        yield from _csv_lines(
+            SAMPLE_CSV_COLUMNS,
+            iter_session_sample_export_rows(connection, session_id=session_id),
+        )
+
+
+def _event_csv(session_id: str) -> Generator[str, None, None]:
+    with closing(_connect(check_same_thread=False)) as connection:
+        yield from _csv_lines(
+            EVENT_CSV_COLUMNS,
+            iter_session_event_export_rows(connection, session_id=session_id),
+        )
+
+
+async def _closing_csv_stream(rows: Generator[str, None, None]) -> AsyncIterator[str]:
+    try:
+        async for row in iterate_in_threadpool(rows):
+            yield row
+    finally:
+        rows.close()
 
 
 @app.get("/ready")
@@ -232,6 +283,39 @@ def session_detail(session_id: str) -> dict[str, Any]:
     if session is None:
         raise HTTPException(status_code=404, detail="session not found")
     return session
+
+
+@app.get("/sessions/{session_id}/samples")
+def session_samples(session_id: str, limit: SessionSampleLimit = 5000) -> dict[str, Any]:
+    with closing(_connect()) as connection:
+        if get_session(connection, session_id) is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        items = fetch_session_samples(connection, session_id=session_id, limit=limit)
+    return {"count": len(items), "items": items}
+
+
+@app.get("/sessions/{session_id}/export.csv")
+def export_session_samples(session_id: str) -> StreamingResponse:
+    with closing(_connect()) as connection:
+        if get_session(connection, session_id) is None:
+            raise HTTPException(status_code=404, detail="session not found")
+    return StreamingResponse(
+        _closing_csv_stream(_sample_csv(session_id)),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="session-{session_id}.csv"'},
+    )
+
+
+@app.get("/sessions/{session_id}/events.csv")
+def export_session_events(session_id: str) -> StreamingResponse:
+    with closing(_connect()) as connection:
+        if get_session(connection, session_id) is None:
+            raise HTTPException(status_code=404, detail="session not found")
+    return StreamingResponse(
+        _closing_csv_stream(_event_csv(session_id)),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="session-{session_id}-events.csv"'},
+    )
 
 
 @app.get("/sessions/{session_id}/events", response_model=SessionEventListResponse)

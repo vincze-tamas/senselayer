@@ -1,11 +1,16 @@
+import asyncio
+import csv
 import importlib
+import io
 import json
 import sqlite3
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
+from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -407,3 +412,179 @@ def test_session_list_limit_validation_returns_422(monkeypatch, tmp_path, limit)
     receiver = load_receiver(monkeypatch, tmp_path)
 
     assert TestClient(receiver.app).get(f"/sessions?limit={limit}").status_code == 422
+
+
+def test_session_samples_are_bounded_and_ordered(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 100.0)
+    session_id = client.post("/sessions", json={"name": "ordered"}).json()["id"]
+    for timestamp in (130.0, 110.0, 120.0):
+        sample = extended_sample()
+        sample["timestamp"] = timestamp
+        assert client.post("/sample", json=sample).status_code == 200
+
+    response = client.get(f"/sessions/{session_id}/samples?limit=2")
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 2
+    assert [item["timestamp"] for item in response.json()["items"]] == [110.0, 120.0]
+    assert response.json()["items"][0]["session_id"] == session_id
+    assert client.get(f"/sessions/{session_id}/samples?limit=0").status_code == 422
+    assert client.get(f"/sessions/{session_id}/samples?limit=5001").status_code == 422
+
+
+def test_session_csv_exports_have_exact_headers_order_rows_and_quoting(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 100.0)
+    session_id = client.post("/sessions", json={"name": "export"}).json()["id"]
+    for timestamp, source in ((120.0, "source,second"), (110.0, "source,first")):
+        sample = extended_sample()
+        sample.update({"timestamp": timestamp, "source": source})
+        assert client.post("/sample", json=sample).status_code == 200
+    for timestamp, kind, label in (
+        (130.0, "second", "plain"),
+        (125.0, "first", 'quoted, "label"'),
+    ):
+        assert client.post(
+            f"/sessions/{session_id}/events",
+            json={"timestamp": timestamp, "kind": kind, "label": label},
+        ).status_code == 201
+
+    sample_response = client.get(f"/sessions/{session_id}/export.csv")
+    event_response = client.get(f"/sessions/{session_id}/events.csv")
+
+    assert sample_response.status_code == 200
+    assert event_response.status_code == 200
+    assert sample_response.headers["content-type"].startswith("text/csv")
+    assert event_response.headers["content-type"].startswith("text/csv")
+    sample_rows = list(csv.reader(io.StringIO(sample_response.text)))
+    event_rows = list(csv.reader(io.StringIO(event_response.text)))
+    assert sample_rows[0] == [
+        "session_id", "timestamp", "received_at", "source", "delta", "theta", "alpha",
+        "beta", "gamma", "signal_quality", "quality_label", "channel_quality_json",
+        "artifact_flags_json",
+    ]
+    assert event_rows[0] == ["session_id", "event_id", "timestamp", "kind", "label"]
+    assert len(sample_rows) == 3
+    assert len(event_rows) == 3
+    assert [float(row[1]) for row in sample_rows[1:]] == [110.0, 120.0]
+    assert [row[3] for row in sample_rows[1:]] == ["source,first", "source,second"]
+    assert sample_rows[1][11] == '{"AF7":0.86,"AF8":0.85,"TP10":0.83,"TP9":0.82}'
+    assert [float(row[2]) for row in event_rows[1:]] == [125.0, 130.0]
+    assert event_rows[1][4] == 'quoted, "label"'
+    assert '"source,first"' in sample_response.text
+    assert '"quoted, ""label"""' in event_response.text
+
+
+def test_empty_session_csv_exports_return_headers_without_data_rows(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    session_id = client.post("/sessions", json={"name": "empty"}).json()["id"]
+
+    assert client.get(f"/sessions/{session_id}/samples").json() == {"count": 0, "items": []}
+    assert len(list(csv.reader(io.StringIO(client.get(f"/sessions/{session_id}/export.csv").text)))) == 1
+    assert len(list(csv.reader(io.StringIO(client.get(f"/sessions/{session_id}/events.csv").text)))) == 1
+
+
+@pytest.mark.parametrize("suffix", ["samples", "export.csv", "events.csv"])
+def test_session_retrieval_and_exports_return_404_for_unknown_session(monkeypatch, tmp_path, suffix):
+    receiver = load_receiver(monkeypatch, tmp_path)
+
+    assert TestClient(receiver.app).get(f"/sessions/missing/{suffix}").status_code == 404
+
+
+def test_session_export_storage_iterator_fetches_in_bounded_batches():
+    from services.storage import iter_session_sample_export_rows
+
+    expected = [("session", 1.0), ("session", 2.0)]
+
+    class Cursor:
+        calls = []
+
+        def fetchmany(self, size):
+            self.calls.append(size)
+            return expected if len(self.calls) == 1 else []
+
+    cursor = Cursor()
+
+    class Connection:
+        def execute(self, sql, parameters):
+            assert "WHERE session_id = ?" in sql
+            assert parameters == ("session",)
+            return cursor
+
+    rows = list(
+        iter_session_sample_export_rows(
+            cast(sqlite3.Connection, Connection()), session_id="session", batch_size=2
+        )
+    )
+
+    assert rows == expected
+    assert cursor.calls == [2, 2]
+
+
+def test_session_csv_streams_can_advance_on_a_different_worker_thread(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    monkeypatch.setattr(receiver.time, "time", lambda: 100.0)
+    session_id = client.post("/sessions", json={"name": "threaded export"}).json()["id"]
+    sample = extended_sample()
+    sample["timestamp"] = 110.0
+    assert client.post("/sample", json=sample).status_code == 200
+    assert client.post(
+        f"/sessions/{session_id}/events",
+        json={"timestamp": 120.0, "kind": "marker", "label": "thread hop"},
+    ).status_code == 201
+
+    for csv_stream in (receiver._sample_csv(session_id), receiver._event_csv(session_id)):
+        assert next(csv_stream)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            assert executor.submit(next, csv_stream).result()
+        csv_stream.close()
+
+
+def test_session_sample_ordering_index_is_created(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+
+    with closing(receiver._connect()) as connection:
+        indexes = {row[1] for row in connection.execute("PRAGMA index_list(samples)")}
+
+    assert "idx_samples_session_timestamp" in indexes
+
+
+def test_aborted_session_csv_stream_closes_database_connection(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+    original_connect = sqlite3.connect
+    connections = []
+
+    class TrackingConnection(sqlite3.Connection):
+        was_closed = False
+
+        def close(self):
+            self.was_closed = True
+            super().close()
+
+    def tracked_connect(*args, **kwargs):
+        connection = original_connect(*args, factory=TrackingConnection, **kwargs)
+        connections.append(connection)
+        return connection
+
+    session_id = client.post("/sessions", json={"name": "aborted export"}).json()["id"]
+    monkeypatch.setattr("services.storage.sqlite3.connect", tracked_connect)
+
+    async def abort_after_header():
+        stream = receiver._closing_csv_stream(receiver._sample_csv(session_id))
+        assert await anext(stream)
+        await stream.aclose()
+
+    asyncio.run(abort_after_header())
+
+    assert len(connections) == 1
+    assert connections[0].was_closed

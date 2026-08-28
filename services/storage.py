@@ -5,7 +5,7 @@ import math
 import sqlite3
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -63,9 +63,9 @@ _SESSION_EVENT_COLUMNS = (
 )
 
 
-def connect_database(path: Path) -> sqlite3.Connection:
+def connect_database(path: Path, *, check_same_thread: bool = True) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=10)
+    connection = sqlite3.connect(path, timeout=10, check_same_thread=check_same_thread)
     try:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA journal_mode=WAL")
@@ -135,6 +135,12 @@ def migrate(connection: sqlite3.Connection) -> None:
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_samples_received_at ON samples(received_at)"
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_samples_session_timestamp
+            ON samples(session_id, timestamp, id)
+            """
         )
         connection.execute(
             """
@@ -321,6 +327,22 @@ def list_session_events(
     return [_session_event_from_row(row) for row in rows]
 
 
+def iter_session_event_export_rows(
+    connection: sqlite3.Connection, *, session_id: str, batch_size: int = 1000
+) -> Iterator[tuple[Any, ...]]:
+    cursor = connection.execute(
+        """
+        SELECT session_id, id, timestamp, kind, label
+        FROM session_events
+        WHERE session_id = ?
+        ORDER BY timestamp ASC, id ASC
+        """,
+        (session_id,),
+    )
+    while rows := cursor.fetchmany(batch_size):
+        yield from rows
+
+
 def insert_sample(
     connection: sqlite3.Connection,
     sample: Mapping[str, Any],
@@ -371,6 +393,21 @@ def insert_sample(
     return stored_sample
 
 
+def _sample_from_row(row: tuple[Any, ...] | sqlite3.Row) -> dict[str, Any]:
+    stored: dict[str, Any] = dict(zip(_SAMPLE_DB_COLUMNS, row, strict=True))
+    channel_quality_json = stored.pop("channel_quality_json")
+    artifact_flags_json = stored.pop("artifact_flags_json")
+    stored["quality_label"] = stored["quality_label"] or "unknown"
+    stored["session_id"] = _normalise_session_id(stored["session_id"])
+    stored["channel_quality"] = (
+        json.loads(channel_quality_json) if channel_quality_json is not None else {}
+    )
+    stored["artifact_flags"] = (
+        json.loads(artifact_flags_json) if artifact_flags_json is not None else []
+    )
+    return stored
+
+
 def fetch_sample_history(connection: sqlite3.Connection, *, limit: int) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
@@ -380,18 +417,39 @@ def fetch_sample_history(connection: sqlite3.Connection, *, limit: int) -> list[
         """,
         (limit,),
     ).fetchall()
-    items: list[dict[str, Any]] = []
-    for row in reversed(rows):
-        stored: dict[str, Any] = dict(zip(_SAMPLE_DB_COLUMNS, row, strict=True))
-        channel_quality_json = stored.pop("channel_quality_json")
-        artifact_flags_json = stored.pop("artifact_flags_json")
-        stored["quality_label"] = stored["quality_label"] or "unknown"
-        stored["session_id"] = _normalise_session_id(stored["session_id"])
-        stored["channel_quality"] = (
-            json.loads(channel_quality_json) if channel_quality_json is not None else {}
-        )
-        stored["artifact_flags"] = (
-            json.loads(artifact_flags_json) if artifact_flags_json is not None else []
-        )
-        items.append(stored)
-    return items
+    return [_sample_from_row(row) for row in reversed(rows)]
+
+
+def fetch_session_samples(
+    connection: sqlite3.Connection, *, session_id: str, limit: int
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT timestamp, received_at, source, delta, theta, alpha, beta, gamma,
+               signal_quality, session_id, quality_label, channel_quality_json, artifact_flags_json
+        FROM samples
+        WHERE session_id = ?
+        ORDER BY timestamp ASC, id ASC
+        LIMIT ?
+        """,
+        (session_id, limit),
+    ).fetchall()
+    return [_sample_from_row(row) for row in rows]
+
+
+def iter_session_sample_export_rows(
+    connection: sqlite3.Connection, *, session_id: str, batch_size: int = 1000
+) -> Iterator[tuple[Any, ...]]:
+    cursor = connection.execute(
+        """
+        SELECT session_id, timestamp, received_at, source, delta, theta, alpha, beta, gamma,
+               signal_quality, COALESCE(quality_label, 'unknown'),
+               COALESCE(channel_quality_json, '{}'), COALESCE(artifact_flags_json, '[]')
+        FROM samples
+        WHERE session_id = ?
+        ORDER BY timestamp ASC, id ASC
+        """,
+        (session_id,),
+    )
+    while rows := cursor.fetchmany(batch_size):
+        yield from rows
