@@ -29,6 +29,21 @@ def valid_sample():
     }
 
 
+def extended_sample():
+    return {
+        **valid_sample(),
+        "signal_quality": 0.84,
+        "quality_label": "good",
+        "channel_quality": {
+            "TP9": 0.82,
+            "AF7": 0.86,
+            "AF8": 0.85,
+            "TP10": 0.83,
+        },
+        "artifact_flags": ["high_frequency_noise"],
+    }
+
+
 def test_waiting_ingest_history_and_fresh_health(monkeypatch, tmp_path):
     receiver = load_receiver(monkeypatch, tmp_path)
     client = TestClient(receiver.app)
@@ -96,3 +111,76 @@ def test_rejects_non_normalized_bands(monkeypatch, tmp_path):
     response = TestClient(receiver.app).post("/sample", json=payload)
     assert response.status_code == 400
     assert "sum to 1" in response.json()["detail"]
+
+
+def test_extended_quality_round_trip_uses_canonical_json(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    assert client.post("/sample", json=extended_sample()).status_code == 200
+
+    history_item = client.get("/history").json()["items"][0]
+    assert history_item["quality_label"] == "good"
+    assert history_item["channel_quality"] == {
+        "TP9": 0.82,
+        "AF7": 0.86,
+        "AF8": 0.85,
+        "TP10": 0.83,
+    }
+    assert history_item["artifact_flags"] == ["high_frequency_noise"]
+    with closing(receiver._connect()) as connection:
+        stored = connection.execute(
+            "SELECT quality_label, channel_quality_json, artifact_flags_json FROM samples"
+        ).fetchone()
+    assert stored == (
+        "good",
+        '{"AF7":0.86,"AF8":0.85,"TP10":0.83,"TP9":0.82}',
+        '["high_frequency_noise"]',
+    )
+
+
+def test_legacy_payload_gets_detailed_quality_defaults(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    client = TestClient(receiver.app)
+
+    assert client.post("/sample", json=valid_sample()).status_code == 200
+
+    history_item = client.get("/history").json()["items"][0]
+    assert history_item["quality_label"] == "unknown"
+    assert history_item["channel_quality"] == {}
+    assert history_item["artifact_flags"] == []
+    assert history_item["signal_quality"] == 1.0
+
+
+@pytest.mark.parametrize("quality_label", ["excellent", "", 123])
+def test_rejects_invalid_quality_labels(monkeypatch, tmp_path, quality_label):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    payload = extended_sample()
+    payload["quality_label"] = quality_label
+
+    assert TestClient(receiver.app).post("/sample", json=payload).status_code == 422
+
+
+def test_rejects_unknown_channel_quality_keys(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    payload = extended_sample()
+    payload["channel_quality"]["AUX"] = 0.5
+
+    assert TestClient(receiver.app).post("/sample", json=payload).status_code == 422
+
+
+@pytest.mark.parametrize("score", ["NaN", "Infinity", "-Infinity"])
+def test_rejects_non_finite_channel_scores(monkeypatch, tmp_path, score):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    payload = extended_sample()
+    payload["channel_quality"]["TP9"] = score
+
+    assert TestClient(receiver.app).post("/sample", json=payload).status_code == 422
+
+
+def test_rejects_oversized_artifact_lists(monkeypatch, tmp_path):
+    receiver = load_receiver(monkeypatch, tmp_path)
+    payload = extended_sample()
+    payload["artifact_flags"] = [f"artifact_{index}" for index in range(17)]
+
+    assert TestClient(receiver.app).post("/sample", json=payload).status_code == 422

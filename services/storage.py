@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
@@ -15,6 +16,12 @@ _SAMPLE_COLUMNS = (
     "beta",
     "gamma",
     "signal_quality",
+)
+
+_SAMPLE_DB_COLUMNS = _SAMPLE_COLUMNS + (
+    "quality_label",
+    "channel_quality_json",
+    "artifact_flags_json",
 )
 
 _SAMPLE_MIGRATION_COLUMNS = {
@@ -110,12 +117,25 @@ def insert_sample(
     *,
     max_history_rows: int,
 ) -> None:
-    values = tuple(sample[column] for column in _SAMPLE_COLUMNS)
+    stored_sample = {
+        **sample,
+        "quality_label": sample.get("quality_label", "unknown"),
+        "channel_quality_json": json.dumps(
+            sample.get("channel_quality", {}), sort_keys=True, separators=(",", ":")
+        ),
+        "artifact_flags_json": json.dumps(
+            sample.get("artifact_flags", []), sort_keys=True, separators=(",", ":")
+        ),
+    }
+    values = tuple(stored_sample[column] for column in _SAMPLE_DB_COLUMNS)
     with connection:
         connection.execute(
             """
-            INSERT INTO samples(timestamp, received_at, source, delta, theta, alpha, beta, gamma, signal_quality)
-            VALUES(?,?,?,?,?,?,?,?,?)
+            INSERT INTO samples(
+                timestamp, received_at, source, delta, theta, alpha, beta, gamma,
+                signal_quality, quality_label, channel_quality_json, artifact_flags_json
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             values,
         )
@@ -129,9 +149,23 @@ def insert_sample(
 def fetch_sample_history(connection: sqlite3.Connection, *, limit: int) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
-        SELECT timestamp, received_at, source, delta, theta, alpha, beta, gamma, signal_quality
+        SELECT timestamp, received_at, source, delta, theta, alpha, beta, gamma,
+               signal_quality, quality_label, channel_quality_json, artifact_flags_json
         FROM samples ORDER BY id DESC LIMIT ?
         """,
         (limit,),
     ).fetchall()
-    return [dict(zip(_SAMPLE_COLUMNS, row, strict=True)) for row in reversed(rows)]
+    items: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        stored: dict[str, Any] = dict(zip(_SAMPLE_DB_COLUMNS, row, strict=True))
+        channel_quality_json = stored.pop("channel_quality_json")
+        artifact_flags_json = stored.pop("artifact_flags_json")
+        stored["quality_label"] = stored["quality_label"] or "unknown"
+        stored["channel_quality"] = (
+            json.loads(channel_quality_json) if channel_quality_json is not None else {}
+        )
+        stored["artifact_flags"] = (
+            json.loads(artifact_flags_json) if artifact_flags_json is not None else []
+        )
+        items.append(stored)
+    return items

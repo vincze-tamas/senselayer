@@ -7,14 +7,15 @@ import sqlite3
 import time
 from contextlib import closing
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from services.storage import connect_database, fetch_sample_history, insert_sample
 
 BANDS = ("delta", "theta", "alpha", "beta", "gamma")
+CHANNELS = frozenset(("TP9", "AF7", "AF8", "TP10"))
 DATA_DIR = Path(os.environ.get("SENSELAYER_DATA_DIR", "data"))
 LATEST_PATH = DATA_DIR / "latest_sample.json"
 HEALTH_PATH = DATA_DIR / "health.json"
@@ -22,6 +23,9 @@ DB_PATH = DATA_DIR / "history.db"
 MAX_HISTORY_ROWS = 250_000
 
 app = FastAPI(title="SenseLayer Muse Receiver", version="2.0.0")
+
+QualityScore = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
+ArtifactFlag = Annotated[str, Field(min_length=1, max_length=64)]
 
 
 class Sample(BaseModel):
@@ -32,7 +36,18 @@ class Sample(BaseModel):
     alpha: float
     beta: float
     gamma: float
-    signal_quality: float = 1.0
+    signal_quality: QualityScore = 1.0
+    quality_label: Literal["good", "marginal", "bad", "unknown"] = "unknown"
+    channel_quality: dict[str, QualityScore] = Field(default_factory=dict, max_length=4)
+    artifact_flags: list[ArtifactFlag] = Field(default_factory=list, max_length=16)
+
+    @field_validator("channel_quality")
+    @classmethod
+    def reject_unknown_channels(cls, value: dict[str, float]) -> dict[str, float]:
+        unknown = set(value) - CHANNELS
+        if unknown:
+            raise ValueError(f"unknown channel_quality keys: {', '.join(sorted(unknown))}")
+        return value
 
 
 def _connect() -> sqlite3.Connection:
