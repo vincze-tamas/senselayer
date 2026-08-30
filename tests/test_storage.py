@@ -1,0 +1,622 @@
+from __future__ import annotations
+
+import sqlite3
+import threading
+import uuid
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from services.storage import (
+    abort_session,
+    complete_session,
+    connect_database,
+    create_session,
+    fetch_sample_history,
+    get_active_session,
+    get_session,
+    insert_sample,
+    list_sessions,
+    create_session_event,
+    list_session_events,
+    migrate,
+)
+
+
+LEGACY_SCHEMA = """
+CREATE TABLE samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    received_at REAL NOT NULL,
+    source TEXT NOT NULL,
+    delta REAL NOT NULL,
+    theta REAL NOT NULL,
+    alpha REAL NOT NULL,
+    beta REAL NOT NULL,
+    gamma REAL NOT NULL,
+    signal_quality REAL NOT NULL
+)
+"""
+
+EXPECTED_SAMPLE_COLUMNS = {
+    "id",
+    "timestamp",
+    "received_at",
+    "source",
+    "delta",
+    "theta",
+    "alpha",
+    "beta",
+    "gamma",
+    "signal_quality",
+    "session_id",
+    "quality_label",
+    "channel_quality_json",
+    "artifact_flags_json",
+}
+
+
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def _sample(timestamp: float, received_at: float, source: str) -> dict[str, object]:
+    return {
+        "timestamp": timestamp,
+        "received_at": received_at,
+        "source": source,
+        "delta": 0.1,
+        "theta": 0.2,
+        "alpha": 0.3,
+        "beta": 0.3,
+        "gamma": 0.1,
+        "signal_quality": 1.0,
+    }
+
+
+def test_connect_database_initializes_empty_database(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "nested" / "history.db")
+    try:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 10_000
+        assert _column_names(connection, "samples") == EXPECTED_SAMPLE_COLUMNS
+        assert _column_names(connection, "sessions") >= {"id", "status", "started_at", "ended_at"}
+        assert _column_names(connection, "session_events") >= {"id", "session_id", "timestamp"}
+        foreign_keys = connection.execute("PRAGMA foreign_key_list(session_events)").fetchall()
+        assert any(row[2] == "sessions" and row[3] == "session_id" for row in foreign_keys)
+    finally:
+        connection.close()
+
+
+def test_migrate_preserves_legacy_rows_and_is_idempotent(tmp_path: Path) -> None:
+    database_path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(database_path)
+    legacy.execute(LEGACY_SCHEMA)
+    legacy.execute(
+        """
+        INSERT INTO samples(timestamp, received_at, source, delta, theta, alpha, beta, gamma, signal_quality)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        (10.0, 11.0, "legacy", 0.1, 0.2, 0.3, 0.3, 0.1, 0.8),
+    )
+    legacy.commit()
+    legacy.close()
+
+    connection = connect_database(database_path)
+    try:
+        migrate(connection)
+        migrate(connection)
+        assert _column_names(connection, "samples") == EXPECTED_SAMPLE_COLUMNS
+        row = connection.execute(
+            "SELECT timestamp, received_at, source, signal_quality, session_id, quality_label "
+            "FROM samples"
+        ).fetchone()
+        assert tuple(row) == (10.0, 11.0, "legacy", 0.8, None, None)
+        assert connection.execute("SELECT COUNT(*) FROM samples").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_sample_storage_round_trip_and_pruning(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        insert_sample(connection, _sample(1.0, 2.0, "first"), max_history_rows=1)
+        insert_sample(connection, _sample(3.0, 4.0, "second"), max_history_rows=1)
+        items = fetch_sample_history(connection, limit=10)
+    finally:
+        connection.close()
+
+    assert [item["source"] for item in items] == ["second"]
+    assert items[0]["alpha"] == 0.3
+
+
+def test_samples_attach_to_active_session_before_during_and_after_stop(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        before = _sample(0.5, 0.6, "before")
+        insert_sample(connection, before, max_history_rows=10)
+
+        session = _create_session(connection)
+        insert_sample(connection, _sample(1.0, 2.0, "during"), max_history_rows=10)
+
+        completed = complete_session(connection, str(session["id"]), ended_at=150.0)
+        assert completed is not None
+
+        insert_sample(connection, _sample(3.0, 4.0, "after"), max_history_rows=10)
+
+        items = fetch_sample_history(connection, limit=10)
+        stored = connection.execute(
+            "SELECT source, session_id FROM samples ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert [item["source"] for item in items] == ["before", "during", "after"]
+    assert [item["session_id"] for item in items] == [None, session["id"], None]
+    assert stored == [("before", None), ("during", session["id"]), ("after", None)]
+
+
+def test_insert_sample_reserves_the_active_session_boundary(tmp_path: Path) -> None:
+    database_path = tmp_path / "history.db"
+    connection = connect_database(database_path)
+    session = _create_session(connection)
+    connection.close()
+
+    begin_seen = threading.Event()
+    release = threading.Event()
+
+    class InterceptingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = (), /):  # type: ignore[override]
+            if sql == "BEGIN IMMEDIATE":
+                result = super().execute(sql, parameters)
+                begin_seen.set()
+                assert release.wait(timeout=5)
+                return result
+            return super().execute(sql, parameters)
+
+    ingest_connection = sqlite3.connect(
+        database_path, timeout=10, factory=InterceptingConnection, check_same_thread=False
+    )
+    stop_connection = sqlite3.connect(database_path, timeout=0.1, check_same_thread=False)
+    result: dict[str, Any] = {}
+    stop_error: list[BaseException] = []
+
+    def ingest() -> None:
+        result["sample"] = insert_sample(
+            ingest_connection,
+            _sample(9.0, 10.0, "boundary"),
+            max_history_rows=10,
+        )
+
+    def stop_session() -> None:
+        try:
+            stop_connection.execute(
+                "UPDATE sessions SET ended_at = ?, status = ? WHERE id = ? AND status = 'active'",
+                (200.0, "completed", session["id"]),
+            )
+            stop_connection.commit()
+        except BaseException as error:
+            stop_error.append(error)
+
+    worker = threading.Thread(target=ingest)
+    worker.start()
+    assert begin_seen.wait(timeout=5)
+
+    stopper = threading.Thread(target=stop_session)
+    stopper.start()
+    stopper.join(timeout=5)
+    release.set()
+    worker.join(timeout=5)
+
+    try:
+        assert worker.is_alive() is False
+        assert stopper.is_alive() is False
+        assert result["sample"]["session_id"] == session["id"]
+        assert stop_error and isinstance(stop_error[0], sqlite3.OperationalError)
+        stored = ingest_connection.execute(
+            "SELECT source, session_id FROM samples ORDER BY id"
+        ).fetchall()
+        assert stored == [("boundary", session["id"])]
+    finally:
+        ingest_connection.close()
+        stop_connection.close()
+
+
+def test_pruning_keeps_session_rows_and_drops_unassigned_rows(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        insert_sample(connection, _sample(1.0, 2.0, "before-1"), max_history_rows=2)
+        insert_sample(connection, _sample(2.0, 3.0, "before-2"), max_history_rows=2)
+
+        session = _create_session(connection)
+        insert_sample(connection, _sample(3.0, 4.0, "attached"), max_history_rows=2)
+        complete_session(connection, str(session["id"]), ended_at=150.0)
+        insert_sample(connection, _sample(4.0, 5.0, "after-1"), max_history_rows=2)
+        insert_sample(connection, _sample(5.0, 6.0, "after-2"), max_history_rows=2)
+
+        items = fetch_sample_history(connection, limit=10)
+        stored = connection.execute(
+            "SELECT source, session_id FROM samples ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert [item["source"] for item in items] == ["attached", "after-1", "after-2"]
+    assert [item["session_id"] for item in items] == [session["id"], None, None]
+    assert stored == [
+        ("attached", session["id"]),
+        ("after-1", None),
+        ("after-2", None),
+    ]
+
+
+def _create_session(
+    connection: sqlite3.Connection,
+    *,
+    name: str = "baseline",
+    created_at: float = 101.0,
+) -> dict[str, object]:
+    return create_session(
+        connection,
+        name=name,
+        notes="eyes open",
+        source="muse2-edge",
+        started_at=100.0,
+        software_version="2.0.0",
+        created_at=created_at,
+    )
+
+
+def test_create_session_round_trip_and_listing(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        created = _create_session(connection)
+        session_id = str(created["id"])
+
+        assert str(uuid.UUID(session_id)) == session_id
+        assert created == {
+            "id": session_id,
+            "name": "baseline",
+            "notes": "eyes open",
+            "source": "muse2-edge",
+            "started_at": 100.0,
+            "ended_at": None,
+            "status": "active",
+            "software_version": "2.0.0",
+            "created_at": 101.0,
+        }
+        assert get_active_session(connection) == created
+        assert get_session(connection, session_id) == created
+        assert list_sessions(connection, limit=10) == [created]
+        assert any(
+            row[1] == "idx_one_active_session" and row[2] == 1 and row[4] == 1
+            for row in connection.execute("PRAGMA index_list(sessions)")
+        )
+    finally:
+        connection.close()
+
+
+def test_create_session_rejects_second_active_session(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        _create_session(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            _create_session(connection, name="conflict")
+        assert get_active_session(connection)["name"] == "baseline"
+    finally:
+        connection.close()
+
+
+def test_complete_session_is_idempotent(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        created = _create_session(connection)
+        completed = complete_session(connection, str(created["id"]), ended_at=150.0)
+        repeated = complete_session(connection, str(created["id"]), ended_at=999.0)
+
+        assert completed is not None
+        assert completed["status"] == "completed"
+        assert completed["ended_at"] == 150.0
+        assert repeated == completed
+        assert get_active_session(connection) is None
+    finally:
+        connection.close()
+
+
+def test_complete_session_rejects_end_before_latest_event_without_mutation(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        created = _create_session(connection)
+        event = create_session_event(
+            connection, session_id=str(created["id"]), kind="future", timestamp=175.0
+        )
+
+        with pytest.raises(ValueError, match="event timestamp"):
+            complete_session(connection, str(created["id"]), ended_at=150.0)
+
+        assert get_session(connection, str(created["id"])) == created
+        assert list_session_events(connection, session_id=str(created["id"])) == [event]
+    finally:
+        connection.close()
+
+
+def test_complete_session_preserves_caller_owned_transaction_on_bound_failure(
+    tmp_path: Path,
+) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        created = _create_session(connection)
+        create_session_event(
+            connection, session_id=str(created["id"]), kind="future", timestamp=175.0
+        )
+        connection.execute("BEGIN IMMEDIATE")
+
+        with pytest.raises(ValueError, match="event timestamp"):
+            complete_session(connection, str(created["id"]), ended_at=150.0)
+
+        assert connection.in_transaction is True
+        connection.rollback()
+        assert get_session(connection, str(created["id"])) == created
+    finally:
+        connection.close()
+
+
+def test_complete_session_preserves_successful_caller_owned_transaction(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        created = _create_session(connection)
+        connection.execute("BEGIN")
+
+        completed = complete_session(connection, str(created["id"]), ended_at=150.0)
+
+        assert completed is not None
+        assert completed["status"] == "completed"
+        assert connection.in_transaction is True
+        connection.rollback()
+        assert get_session(connection, str(created["id"])) == created
+    finally:
+        connection.close()
+
+
+def test_complete_session_holds_write_lock_through_event_bound_check(tmp_path: Path) -> None:
+    database_path = tmp_path / "history.db"
+    setup_connection = connect_database(database_path)
+    session = _create_session(setup_connection)
+    setup_connection.close()
+
+    begin_seen = threading.Event()
+    release = threading.Event()
+
+    class InterceptingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = (), /):  # type: ignore[override]
+            result = super().execute(sql, parameters)
+            if sql == "BEGIN IMMEDIATE":
+                begin_seen.set()
+                assert release.wait(timeout=5)
+            return result
+
+    complete_connection = sqlite3.connect(
+        database_path, timeout=10, factory=InterceptingConnection, check_same_thread=False
+    )
+    event_connection = sqlite3.connect(database_path, timeout=0.1, check_same_thread=False)
+    result: dict[str, Any] = {}
+    event_error: list[BaseException] = []
+
+    def complete() -> None:
+        result["session"] = complete_session(
+            complete_connection, str(session["id"]), ended_at=150.0
+        )
+
+    def add_event() -> None:
+        try:
+            create_session_event(
+                event_connection,
+                session_id=str(session["id"]),
+                kind="marker",
+                timestamp=140.0,
+            )
+        except BaseException as error:
+            event_error.append(error)
+
+    completer = threading.Thread(target=complete)
+    completer.start()
+    assert begin_seen.wait(timeout=5)
+    event_writer = threading.Thread(target=add_event)
+    event_writer.start()
+    event_writer.join(timeout=5)
+    release.set()
+    completer.join(timeout=5)
+
+    try:
+        assert completer.is_alive() is False
+        assert event_writer.is_alive() is False
+        assert result["session"]["status"] == "completed"
+        assert event_error and isinstance(event_error[0], sqlite3.OperationalError)
+        assert list_session_events(complete_connection, session_id=str(session["id"])) == []
+    finally:
+        complete_connection.close()
+        event_connection.close()
+
+
+def test_abort_session_closes_active_session_and_allows_reopen(tmp_path: Path) -> None:
+    database_path = tmp_path / "history.db"
+    connection = connect_database(database_path)
+    created = _create_session(connection)
+    connection.close()
+
+    reopened = connect_database(database_path)
+    try:
+        assert get_active_session(reopened) == created
+        aborted = abort_session(reopened, str(created["id"]), ended_at=160.0)
+        replacement = _create_session(reopened, name="replacement", created_at=102.0)
+
+        assert aborted is not None
+        assert aborted["status"] == "aborted"
+        assert aborted["ended_at"] == 160.0
+        assert get_active_session(reopened) == replacement
+        assert [item["name"] for item in list_sessions(reopened, limit=1)] == ["replacement"]
+    finally:
+        reopened.close()
+
+
+def test_session_transitions_return_none_for_unknown_id(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        assert get_session(connection, "missing") is None
+        assert complete_session(connection, "missing", ended_at=150.0) is None
+        assert abort_session(connection, "missing", ended_at=150.0) is None
+    finally:
+        connection.close()
+
+
+def test_session_events_round_trip_and_deterministic_ordering(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        session = _create_session(connection)
+        create_session_event(connection, session_id=str(session["id"]), kind="start", timestamp=100.0)
+        create_session_event(
+            connection, session_id=str(session["id"]), kind="sample", timestamp=150.0, label="beta"
+        )
+        create_session_event(connection, session_id=str(session["id"]), kind="stop", timestamp=120.0)
+
+        events = list_session_events(connection, session_id=str(session["id"]))
+    finally:
+        connection.close()
+
+    assert [event["kind"] for event in events] == ["start", "stop", "sample"]
+    assert [event["timestamp"] for event in events] == [100.0, 120.0, 150.0]
+    assert events[1]["label"] == ""
+
+
+def test_create_session_event_rejects_missing_session_aborted_and_out_of_interval(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        session = _create_session(connection)
+        complete_session(connection, str(session["id"]), ended_at=200.0)
+        aborted = _create_session(connection, name="aborted", created_at=102.0)
+        abort_session(connection, str(aborted["id"]), ended_at=180.0)
+
+        with pytest.raises(LookupError):
+            create_session_event(connection, session_id="missing", kind="start")
+        with pytest.raises(ValueError):
+            create_session_event(connection, session_id=str(aborted["id"]), kind="start", timestamp=150.0)
+        with pytest.raises(ValueError):
+            create_session_event(connection, session_id=str(session["id"]), kind="start", timestamp=99.0)
+        with pytest.raises(ValueError):
+            create_session_event(connection, session_id=str(session["id"]), kind="start", timestamp=201.0)
+        assert connection.execute("SELECT COUNT(*) FROM session_events").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_abort_keeps_existing_markers_but_rejects_new_ones(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        session = _create_session(connection)
+        historical = create_session_event(
+            connection, session_id=str(session["id"]), kind="historical", timestamp=150.0
+        )
+
+        aborted = abort_session(connection, str(session["id"]), ended_at=140.0)
+
+        assert aborted is not None
+        assert aborted["status"] == "aborted"
+        assert list_session_events(connection, session_id=str(session["id"])) == [historical]
+        with pytest.raises(ValueError, match="aborted"):
+            create_session_event(
+                connection, session_id=str(session["id"]), kind="late", timestamp=130.0
+            )
+        assert list_session_events(connection, session_id=str(session["id"])) == [historical]
+    finally:
+        connection.close()
+
+
+def test_create_session_event_blocks_concurrent_stop_until_insert_commits(tmp_path: Path) -> None:
+    database_path = tmp_path / "history.db"
+    connection = connect_database(database_path)
+    session = _create_session(connection)
+    connection.close()
+
+    begin_seen = threading.Event()
+    release = threading.Event()
+
+    class InterceptingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = (), /):  # type: ignore[override]
+            if sql == "BEGIN IMMEDIATE":
+                result = super().execute(sql, parameters)
+                begin_seen.set()
+                assert release.wait(timeout=5)
+                return result
+            return super().execute(sql, parameters)
+
+    event_connection = sqlite3.connect(
+        database_path, timeout=10, factory=InterceptingConnection, check_same_thread=False
+    )
+    stop_connection = sqlite3.connect(database_path, timeout=0.1, check_same_thread=False)
+    result: dict[str, Any] = {}
+    stop_error: list[BaseException] = []
+
+    def add_event() -> None:
+        result["event"] = create_session_event(
+            event_connection,
+            session_id=str(session["id"]),
+            kind="marker",
+            timestamp=150.0,
+        )
+
+    def stop_session() -> None:
+        try:
+            stop_session = abort_session(stop_connection, str(session["id"]), ended_at=200.0)
+            result["stop"] = stop_session
+        except BaseException as error:
+            stop_error.append(error)
+
+    worker = threading.Thread(target=add_event)
+    worker.start()
+    assert begin_seen.wait(timeout=5)
+
+    stopper = threading.Thread(target=stop_session)
+    stopper.start()
+    stopper.join(timeout=5)
+    release.set()
+    worker.join(timeout=5)
+
+    try:
+        assert worker.is_alive() is False
+        assert stopper.is_alive() is False
+        assert result["event"]["session_id"] == session["id"]
+        assert stop_error and isinstance(stop_error[0], sqlite3.OperationalError)
+        stored = event_connection.execute(
+            "SELECT kind, timestamp FROM session_events ORDER BY id"
+        ).fetchall()
+        assert stored == [("marker", 150.0)]
+    finally:
+        event_connection.close()
+        stop_connection.close()
+
+
+@pytest.mark.parametrize("timestamp", [float("nan"), float("inf"), float("-inf")])
+def test_create_session_event_rejects_non_finite_timestamps(tmp_path: Path, timestamp: float) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        session = _create_session(connection)
+        with pytest.raises(ValueError):
+            create_session_event(connection, session_id=str(session["id"]), kind="start", timestamp=timestamp)
+        assert connection.execute("SELECT COUNT(*) FROM session_events").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("kind,label", [("", "x"), ("x" * 65, "x"), ("start", "x" * 121)])
+def test_create_session_event_validates_kind_and_label_bounds(
+    tmp_path: Path, kind: str, label: str
+) -> None:
+    connection = connect_database(tmp_path / "history.db")
+    try:
+        session = _create_session(connection)
+        with pytest.raises(ValueError):
+            create_session_event(connection, session_id=str(session["id"]), kind=kind, label=label, timestamp=100.0)
+    finally:
+        connection.close()

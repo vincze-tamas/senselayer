@@ -12,6 +12,8 @@ from typing import Dict, Iterable
 import numpy as np
 import requests
 
+from pipeline.eeg_quality import DEFAULT_CHANNEL_NAMES, analyze_quality
+
 BANDS = ("delta", "theta", "alpha", "beta", "gamma")
 
 
@@ -49,7 +51,7 @@ def normalize_bands(bands: Dict[str, float]) -> Dict[str, float]:
     return {key: value / total for key, value in values.items()}
 
 
-def post_sample(url: str, payload: Dict[str, float | str], timeout: float = 5.0) -> None:
+def post_sample(url: str, payload: Dict[str, object], timeout: float = 5.0) -> None:
     response = requests.post(url.rstrip("/") + "/sample", json=payload, timeout=timeout)
     response.raise_for_status()
 
@@ -66,15 +68,44 @@ def simulated_bands(index: int) -> Dict[str, float]:
     return normalize_bands(raw)
 
 
+def simulation_payload(
+    args: argparse.Namespace, index: int, timestamp: float | None = None
+) -> Dict[str, object]:
+    return {
+        "timestamp": time.time() if timestamp is None else timestamp,
+        "source": args.source_name + "-sim",
+        **simulated_bands(index),
+        "signal_quality": 1.0,
+        "quality_label": "good",
+        "channel_quality": {name: 1.0 for name in DEFAULT_CHANNEL_NAMES},
+        "artifact_flags": [],
+    }
+
+
+def live_payload(
+    window: np.ndarray,
+    source_name: str,
+    sample_rate: int,
+    timestamp: float | None = None,
+) -> Dict[str, object]:
+    values = np.asarray(window, dtype=np.float64)
+    bands = normalize_bands(band_powers(values, fs=sample_rate))
+    quality = analyze_quality(values, sample_rate)
+    return {
+        "timestamp": time.time() if timestamp is None else timestamp,
+        "source": source_name,
+        **bands,
+        "signal_quality": quality.score,
+        "quality_label": quality.label,
+        "channel_quality": quality.channel_quality,
+        "artifact_flags": list(quality.artifact_flags),
+    }
+
+
 def run_simulation(args: argparse.Namespace) -> int:
     sent = 0
     while args.max_samples <= 0 or sent < args.max_samples:
-        payload = {
-            "timestamp": time.time(),
-            "source": args.source_name + "-sim",
-            **simulated_bands(sent),
-            "signal_quality": 1.0,
-        }
+        payload = simulation_payload(args, sent)
         post_sample(args.receiver, payload, timeout=args.http_timeout)
         print(json.dumps(payload, sort_keys=True), flush=True)
         sent += 1
@@ -124,13 +155,7 @@ def run_lsl(args: argparse.Namespace) -> int:
             continue
 
         try:
-            bands = normalize_bands(band_powers(np.asarray(samples), fs=args.sample_rate))
-            payload = {
-                "timestamp": time.time(),
-                "source": args.source_name,
-                **bands,
-                "signal_quality": 1.0,
-            }
+            payload = live_payload(np.asarray(samples), args.source_name, args.sample_rate)
             post_sample(args.receiver, payload, timeout=args.http_timeout)
             print(json.dumps(payload, sort_keys=True), flush=True)
             last_post_at = now

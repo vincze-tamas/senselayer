@@ -6,6 +6,27 @@ Muse 2 EEG collector, private receiver and dashboard. The receiver and dashboard
 
 - [Product roadmap](docs/ROADMAP.md)
 - [Signal quality and replayable sessions implementation plan](docs/plans/2026-08-28-signal-quality-and-sessions.md)
+- [Task 13 acceptance and rollback notes](docs/acceptance/signal-quality-and-sessions.md)
+
+## Task 13 verification
+
+Safe local-only verification for the signal-quality and sessions milestone:
+
+- `.venv/bin/pytest -q`: 178 passed.
+- `python3 -m compileall -q services sources pipeline scripts sim.py ui.py`: passed.
+- `git diff --check 632783a..HEAD`: passed for the cumulative Task 13 range.
+- `git status --porcelain`: empty after the final commit.
+- PowerShell parser validation for `scripts/install_windows.ps1` with Docker: passed.
+
+The controlled server-side deployment of `f7022c7` is complete: rollback backup checksums passed, all 980 pre-existing samples survived migration, services are enabled/active on loopback only, health probes passed, the fail-closed dashboard rendered without simulated data, and a named session/API/CSV smoke test passed. Physical Muse acceptance, SSH tunnel recovery, network reconnect, and Windows reboot validation remain a separate live gate.
+
+## Rollback guidance
+
+- Stop the receiver and every process that can write `data/history.db` before replacing code or taking the database backup.
+- Back up `data/history.db`, `data/history.db-wal`, and `data/history.db-shm` together.
+- Restore the prior Git commit and venv-compatible requirements.
+- Restart services and verify `/ready`, `/health`, and loopback bindings.
+- Never delete or recreate the migrated database during rollback.
 
 ## Security model
 

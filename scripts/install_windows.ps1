@@ -15,6 +15,7 @@ $Python = Join-Path $Venv "Scripts\python.exe"
 $KnownHosts = Join-Path $Base "known_hosts"
 $TaskName = "SenseLayerMuse2"
 $Source = $PSScriptRoot
+$PipelineBase = Join-Path $Base "pipeline"
 
 function Require-Command([string]$Name, [string]$InstallHint) {
   if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
@@ -32,6 +33,7 @@ foreach ($candidate in @("py.exe", "python.exe")) {
 if (-not $PyLauncher) { throw "Python is missing. Install Python 3.11: winget install -e --id Python.Python.3.11" }
 
 New-Item -ItemType Directory -Force -Path $Base | Out-Null
+New-Item -ItemType Directory -Force -Path $PipelineBase | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path $IdentityFile) | Out-Null
 
 if (-not (Test-Path $IdentityFile)) {
@@ -62,6 +64,8 @@ if ($LASTEXITCODE -ne 0) { throw "SenseLayer Python dependency installation fail
 
 Copy-Item -Force (Join-Path $Source "muse2_edge_collector.py") (Join-Path $Base "muse2_edge_collector.py")
 Copy-Item -Force (Join-Path $Source "senselayer_supervisor.py") (Join-Path $Base "senselayer_supervisor.py")
+Copy-Item -Force (Join-Path $Source "..\pipeline\__init__.py") (Join-Path $PipelineBase "__init__.py")
+Copy-Item -Force (Join-Path $Source "..\pipeline\eeg_quality.py") (Join-Path $PipelineBase "eeg_quality.py")
 
 $Config = [ordered]@{
   ssh_host = $SshHost
@@ -104,6 +108,15 @@ $Runner = Join-Path $Base "run_senselayer.cmd"
 $QuotedRunner = '"' + $Runner + '"'
 schtasks.exe /Create /SC ONLOGON /TN $TaskName /TR $QuotedRunner /RL LIMITED /F | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Task Scheduler registration failed" }
+
+# schtasks creates ONLOGON tasks with battery restrictions on some Windows
+# builds. On laptops that leaves an explicitly started collector stuck in
+# Queued while unplugged. SenseLayer must remain available on battery power.
+$ScheduledTask = Get-ScheduledTask -TaskName $TaskName
+$TaskSettings = $ScheduledTask.Settings
+$TaskSettings.DisallowStartIfOnBatteries = $false
+$TaskSettings.StopIfGoingOnBatteries = $false
+Set-ScheduledTask -TaskName $TaskName -Settings $TaskSettings | Out-Null
 
 Write-Host "SenseLayer installed idempotently." -ForegroundColor Green
 Write-Host "Autostart task: $TaskName"
