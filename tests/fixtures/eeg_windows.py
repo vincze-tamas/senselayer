@@ -29,16 +29,42 @@ def flatline() -> np.ndarray:
 
 def extreme_amplitude() -> np.ndarray:
     t = _base_time()
-    base = 250.0 * np.sin(2 * np.pi * 10 * t)
+    base = 500.0 * np.sin(2 * np.pi * 10 * t)
     return _stack([base, 1.05 * base, 0.95 * base, base])
 
 
 def abrupt_steps() -> np.ndarray:
     half = N_SAMPLES // 2
-    first = np.full(half, -1.0, dtype=float)
-    second = np.full(N_SAMPLES - half, 1.0, dtype=float)
-    stepped = np.concatenate([first, second])
+    stepped = np.concatenate(
+        [np.full(half, -250.0), np.full(N_SAMPLES - half, 250.0)]
+    )
     return _stack([stepped, stepped * 0.85, stepped * 1.1, stepped])
+
+
+def muse_scale_good_contact() -> np.ndarray:
+    """Deterministic Muse-like microvolt signal with per-channel DC offsets."""
+    t = _base_time()
+    base = np.sin(2 * np.pi * 10 * t) + 0.25 * np.sin(2 * np.pi * 3 * t)
+    offsets = np.asarray([-31.7, -30.8, -42.5, -21.5])
+    amplitudes = np.asarray([70.0, 14.0, 20.0, 42.0])
+    return offsets + base[:, None] * amplitudes
+
+
+def muse_scale_tp10_disconnected() -> np.ndarray:
+    """Muse-like baseline with a large, noisy disconnected TP10 channel."""
+    window = muse_scale_good_contact()
+    t = _base_time()
+    window[:, 3] = -409.0 + 520.0 * np.sin(2 * np.pi * 40 * t)
+    return window
+
+
+def muse_scale_recovered_contact() -> np.ndarray:
+    """Deterministic Muse-like signal based on the measured recovery leg."""
+    t = _base_time()
+    base = np.sin(2 * np.pi * 10 * t) + 0.15 * np.sin(2 * np.pi * 3 * t)
+    offsets = np.asarray([-31.7, -30.8, -42.5, -21.5])
+    amplitudes = np.asarray([140.0, 35.0, 70.0, 83.0])
+    return offsets + base[:, None] * amplitudes
 
 
 def high_frequency_contamination() -> np.ndarray:

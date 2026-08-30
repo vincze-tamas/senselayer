@@ -15,14 +15,18 @@ DEFAULT_CHANNEL_NAMES = ("TP9", "AF7", "AF8", "TP10")
 GOOD_SCORE_THRESHOLD = 0.75
 MARGINAL_SCORE_THRESHOLD = 0.45
 FLATLINE_STD_THRESHOLD = 1e-6
-EXTREME_AMPLITUDE_THRESHOLD = 100.0
+# Muse LSL EEG samples are expressed in microvolts and retain a channel-specific
+# DC offset. Threshold amplitude only after robust centering.
+EXTREME_AMPLITUDE_THRESHOLD = 250.0
 EXTREME_RATIO_THRESHOLD = 0.05
-ABRUPT_STEP_THRESHOLD = 1.5
+ABRUPT_STEP_THRESHOLD = 180.0
+ABRUPT_STEP_RATIO_THRESHOLD = 0.01
+SEVERE_ABRUPT_STEP_THRESHOLD = 300.0
 HIGH_FREQUENCY_LOW_HZ = 30.0
 HIGH_FREQUENCY_HIGH_HZ = 45.0
 HIGH_FREQUENCY_RATIO_THRESHOLD = 0.20
 CHANNEL_OUTLIER_RATIO_THRESHOLD = 4.0
-CHANNEL_AGREEMENT_THRESHOLD = 0.50
+CHANNEL_AGREEMENT_THRESHOLD = 0.85
 
 BLOCKING_ARTIFACTS = frozenset(
     {
@@ -81,31 +85,30 @@ def _extreme_amplitude_ratio(channel: np.ndarray) -> float:
     finite = _finite_values(channel)
     if finite.size == 0:
         return 1.0
-    return _clamp01(float(np.mean(np.abs(finite) > EXTREME_AMPLITUDE_THRESHOLD)))
+    centered = finite - np.median(finite)
+    return _clamp01(float(np.mean(np.abs(centered) > EXTREME_AMPLITUDE_THRESHOLD)))
 
 
 def _abrupt_step_ratio(channel: np.ndarray) -> float:
     adjacent = np.isfinite(channel[:-1]) & np.isfinite(channel[1:])
     if not np.any(adjacent):
         return 1.0
-    scale = float(np.max(np.abs(channel[np.isfinite(channel)])))
-    if scale == 0.0:
+    differences = np.abs(np.diff(channel)[adjacent])
+    return _clamp01(float(np.mean(differences > ABRUPT_STEP_THRESHOLD)))
+
+
+def _maximum_step(channel: np.ndarray) -> float:
+    adjacent = np.isfinite(channel[:-1]) & np.isfinite(channel[1:])
+    if not np.any(adjacent):
         return 0.0
-    scaled_differences = np.abs(np.diff(channel / scale)[adjacent])
-    return _clamp01(
-        float(np.mean(scaled_differences > ABRUPT_STEP_THRESHOLD / scale))
-    )
+    return float(np.max(np.abs(np.diff(channel)[adjacent])))
 
 
 def _has_abrupt_step(channel: np.ndarray) -> bool:
-    adjacent = np.isfinite(channel[:-1]) & np.isfinite(channel[1:])
-    if not np.any(adjacent):
-        return False
-    scale = float(np.max(np.abs(channel[np.isfinite(channel)])))
-    if scale == 0.0:
-        return False
-    scaled_differences = np.abs(np.diff(channel / scale)[adjacent])
-    return bool(np.max(scaled_differences) > ABRUPT_STEP_THRESHOLD / scale)
+    return (
+        _maximum_step(channel) > SEVERE_ABRUPT_STEP_THRESHOLD
+        or _abrupt_step_ratio(channel) >= ABRUPT_STEP_RATIO_THRESHOLD
+    )
 
 
 def _high_frequency_ratio(channel: np.ndarray, sample_rate: int) -> float:
@@ -212,12 +215,17 @@ def _channel_score(channel: np.ndarray, sample_rate: int, is_outlier: bool) -> f
     extreme = _extreme_amplitude_ratio(channel)
     abrupt = _abrupt_step_ratio(channel)
     high_frequency = _high_frequency_ratio(channel, sample_rate)
+    abrupt_score = (
+        0.0
+        if _maximum_step(channel) > SEVERE_ABRUPT_STEP_THRESHOLD
+        else _clamp01(1.0 - abrupt / ABRUPT_STEP_RATIO_THRESHOLD)
+    )
 
     component_scores = (
         finite,
         flatline,
         _clamp01(1.0 - extreme / EXTREME_RATIO_THRESHOLD),
-        _clamp01(1.0 - abrupt),
+        abrupt_score,
         _clamp01(1.0 - high_frequency / HIGH_FREQUENCY_RATIO_THRESHOLD),
         0.0 if is_outlier else 1.0,
     )

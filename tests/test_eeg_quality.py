@@ -10,6 +10,9 @@ from tests.fixtures.eeg_windows import (
     extreme_amplitude,
     flatline,
     high_frequency_contamination,
+    muse_scale_good_contact,
+    muse_scale_recovered_contact,
+    muse_scale_tp10_disconnected,
     non_finite_samples,
     one_channel_outlier,
 )
@@ -146,3 +149,32 @@ def test_analyze_quality_requires_peer_consensus_for_channel_outlier():
     result = analyze_quality(phase_shifted, sample_rate=FS)
 
     assert "channel_outlier" not in result.artifact_flags
+
+
+def test_muse_scale_good_contact_is_not_rejected_by_dc_offset_or_normal_steps():
+    result = analyze_quality(muse_scale_good_contact(), sample_rate=FS)
+
+    assert result.label == "good"
+    assert "extreme_amplitude" not in result.artifact_flags
+    assert "abrupt_steps" not in result.artifact_flags
+
+
+def test_muse_scale_disconnected_tp10_is_blocked():
+    result = analyze_quality(muse_scale_tp10_disconnected(), sample_rate=FS)
+
+    assert result.label == "bad"
+    assert "extreme_amplitude" in result.artifact_flags
+    assert result.channel_quality["TP10"] < result.channel_quality["TP9"]
+
+
+def test_muse_scale_quality_worsens_and_recovers():
+    before = analyze_quality(muse_scale_good_contact(), sample_rate=FS)
+    disconnected = analyze_quality(muse_scale_tp10_disconnected(), sample_rate=FS)
+    recovered = analyze_quality(muse_scale_recovered_contact(), sample_rate=FS)
+
+    assert (before.label, disconnected.label, recovered.label) == (
+        "good",
+        "bad",
+        "good",
+    )
+    assert recovered.artifact_flags == ()
