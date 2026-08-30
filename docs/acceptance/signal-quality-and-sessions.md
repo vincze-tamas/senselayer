@@ -8,15 +8,15 @@ This milestone is validated in three parts:
 
 - **Completed safe local/static verification**: repository-only checks that can run without hardware, live services, SSH, or deployment.
 - **Completed server-side deployment/runtime verification**: controlled deployment and loopback-only service checks on `dn-dev-01`.
-- **Not run here**: physical Muse 2 runs, SSH tunnel recovery, Windows reconnect/reboot checks, and network reconnect validation.
+- **Completed Windows/physical verification**: live Muse quality transitions, SSH/network recovery, and Windows ONLOGON reboot recovery.
 
-This document records completed local and server-side verification and what remains a Windows/physical gate.
+This document records the completed local, server-side, Windows, and physical verification.
 
 ## Completed safe local/static verification
 
 The Task 13 controller completed the safe local-only checks with these results:
 
-- `.venv/bin/pytest -q`: 178 passed with one pre-existing third-party deprecation warning.
+- `.venv/bin/pytest -q`: 182 passed with one pre-existing third-party deprecation warning.
 - `python3 -m compileall -q services sources pipeline scripts sim.py ui.py`: passed.
 - `git diff --check 632783a..HEAD`: passed for the cumulative Task 13 range.
 - `git status --porcelain`: empty after the final commit.
@@ -43,22 +43,29 @@ On 2026-08-30, commit `f7022c7e75b21def5b5eef55b06f219a94e3a545` was deployed to
 - A named deployment-smoke session completed start, event marker, stop, event CSV, and sample CSV-header checks. No active smoke session was left behind.
 - `pip check` reported no broken requirements and recent service logs contained no warnings.
 
-## Not run here: Windows / physical acceptance gates
+## Completed Windows / physical acceptance
 
-The following checks require the Windows collector and real Muse hardware:
+On 2026-08-30, the Windows edge package from commit `dbd5dab7071630f95bf5ee4458267d23667e58c5` was installed and verified:
 
-- SSH tunnel recovery remains healthy.
-- Muse reconnect remains healthy.
-- Network reconnect remains healthy.
-- Windows reboot auto-start remains healthy.
+- Package SHA-256: `edf85f9fbf5d45b489a96e67ca3da0c60a7bf10df31cbb2f6ab8494cd4f97b58`.
+- Installed `pipeline/eeg_quality.py` SHA-256: `c2718745a17b6c3cc3553fb0c4c9efd5ea67671279e78cf1a5b64fb400f09929`.
+- The `SenseLayerMuse2` task reported `Running`.
+- The installer disables the Task Scheduler battery restrictions that had left the task `Queued`; targeted tests and PowerShell parser validation passed.
 
-Run the real-Muse quality protocol exactly as follows:
+The real-Muse protocol completed under session `72525cbb-efb3-4ddf-b965-bdc08672fbd0` (`physical-acceptance-v4-2026-08-30`):
 
-1. Record 30 seconds with the Muse worn correctly.
-2. Remove one electrode for 20 seconds.
-3. Restore the electrode for 30 seconds.
-4. Confirm quality worsens and then recovers, with both transitions present in exported session data.
-5. Confirm no derived State/Focus output appears during bad quality.
+1. **Good contact, 30 seconds:** 31/31 samples were `good`; median quality was `0.967`; no artifact flags were present.
+2. **TP10 removed, 20 seconds:** 20/21 samples were `bad`; median TP10 quality fell to `0.649`; `extreme_amplitude`, `abrupt_steps`, and `channel_outlier` flags appeared.
+3. **TP10 restored, 30 seconds:** median aggregate quality recovered to `0.936`; median TP10 quality recovered to `0.893`; contact-loss flags returned to zero. Twenty samples were `good`; eleven were conservatively blocked only by `high_frequency_noise`.
+4. The completed session export contains 190 ordered sample rows and both quality transitions. CSV SHA-256: `9b707803dcc0411c8014188fb72010869ece3d14c441a47832e1bdb655968b0d`.
+5. Captured physical `bad` samples exercise the production `bad` label. `ui.should_show_derived_state("bad")` is false, and the production render regression verifies both State and Focus are replaced with `Suppressed: insufficient signal quality`; the focused dashboard/client suite passed 66 tests. The CSV intentionally contains no derived State/Focus columns.
+6. The session stopped as `completed`, and the active-session count returned to zero.
+
+Runtime recovery also passed:
+
+- **Network and SSH-tunnel reconnect:** the receiver became `stale` during the deliberate Wi-Fi interruption, then returned to sustained `fresh` automatically without restarting the task. The collector posts only to `http://127.0.0.1:18787`; `senselayer_supervisor.py` creates that local endpoint exclusively with `ssh -L 127.0.0.1:18787:127.0.0.1:8787` and waits for its `/health` response before starting the collector. Resumed remote ingestion therefore verifies recovery of the supervised SSH-forwarded data path, not merely local collector activity.
+- **Windows reboot / ONLOGON:** the reboot produced a 101.7-second sample gap; after login, ingestion returned to `fresh` without manually starting the task or installer.
+- These runs also exercised collector supervision, Muse reconnect, network reconnect, and Windows ONLOGON startup.
 
 ## Rollback guidance
 
