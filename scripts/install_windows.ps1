@@ -109,6 +109,15 @@ $QuotedRunner = '"' + $Runner + '"'
 schtasks.exe /Create /SC ONLOGON /TN $TaskName /TR $QuotedRunner /RL LIMITED /F | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Task Scheduler registration failed" }
 
+# schtasks creates ONLOGON tasks with battery restrictions on some Windows
+# builds. On laptops that leaves an explicitly started collector stuck in
+# Queued while unplugged. SenseLayer must remain available on battery power.
+$ScheduledTask = Get-ScheduledTask -TaskName $TaskName
+$TaskSettings = $ScheduledTask.Settings
+$TaskSettings.DisallowStartIfOnBatteries = $false
+$TaskSettings.StopIfGoingOnBatteries = $false
+Set-ScheduledTask -TaskName $TaskName -Settings $TaskSettings | Out-Null
+
 Write-Host "SenseLayer installed idempotently." -ForegroundColor Green
 Write-Host "Autostart task: $TaskName"
 Write-Host "Dashboard after startup: http://127.0.0.1:18501"
