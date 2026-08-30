@@ -18,7 +18,7 @@ Safe local-only verification for the signal-quality and sessions milestone:
 - `git status --porcelain`: empty after the final commit.
 - PowerShell parser validation for `scripts/install_windows.ps1` with Docker: passed.
 
-These checks cover repository integrity only. Live receiver/dashboard checks, physical Muse acceptance, SSH tunnel recovery, reboot validation, and deployment-side health probes remain a separate live gate.
+The controlled server-side deployment of `f7022c7` is complete: rollback backup checksums passed, all 980 pre-existing samples survived migration, services are enabled/active on loopback only, health probes passed, the fail-closed dashboard rendered without simulated data, and a named session/API/CSV smoke test passed. Physical Muse acceptance, SSH tunnel recovery, network reconnect, and Windows reboot validation remain a separate live gate.
 
 ## Rollback guidance
 

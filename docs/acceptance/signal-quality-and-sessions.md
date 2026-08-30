@@ -4,12 +4,13 @@ Task 13 documents the regression, deployment, and real-Muse acceptance gate for 
 
 ## Scope
 
-This milestone is validated in two parts:
+This milestone is validated in three parts:
 
 - **Completed safe local/static verification**: repository-only checks that can run without hardware, live services, SSH, or deployment.
-- **Not run here**: live receiver/dashboard health probes, physical Muse 2 runs, SSH tunnel checks, Windows reboot checks, and any deployment-side runtime validation.
+- **Completed server-side deployment/runtime verification**: controlled deployment and loopback-only service checks on `dn-dev-01`.
+- **Not run here**: physical Muse 2 runs, SSH tunnel recovery, Windows reconnect/reboot checks, and network reconnect validation.
 
-This document records what is safe to verify locally and what remains a live gate.
+This document records completed local and server-side verification and what remains a Windows/physical gate.
 
 ## Completed safe local/static verification
 
@@ -28,13 +29,24 @@ The Task 13 controller completed the safe local-only checks with these results:
 
 If any of these fail, fix the repository before moving to the live gate.
 
-## Not run here: live / physical acceptance gates
+## Completed server-side deployment/runtime verification
 
-The following checks remain outside the safe local-only scope and must be run only in the live environment with the real deployment and Muse hardware:
+On 2026-08-30, commit `f7022c7e75b21def5b5eef55b06f219a94e3a545` was deployed to `dn-dev-01` with this evidence:
 
-- Receiver and dashboard stay enabled and active.
-- Listeners remain bound only to `127.0.0.1:8787` and `127.0.0.1:8501`.
-- Existing `history.db` migrates without row loss.
+- The receiver and dashboard were stopped before backup and code replacement, then returned to `enabled` and `active`.
+- `/opt/backups/senselayer/20260830-100943` contains the prior deployed code and the `history.db`, `history.db-wal`, and `history.db-shm` trio; every recorded SHA-256 checksum passed verification.
+- SQLite `PRAGMA integrity_check` remained `ok`; all 980 pre-existing sample rows remained present after migration.
+- The `sessions` and `session_events` tables were added without recreating the existing database.
+- Receiver `/ready`, `/health`, and dashboard `/_stcore/health` returned success.
+- Listeners remained bound only to `127.0.0.1:8787` and `127.0.0.1:8501`.
+- The dashboard rendered `Live data unavailable` while the collector was stale and did not fabricate simulated live data; the production unit explicitly sets `SENSELAYER_ALLOW_SIMULATION=false`.
+- A named deployment-smoke session completed start, event marker, stop, event CSV, and sample CSV-header checks. No active smoke session was left behind.
+- `pip check` reported no broken requirements and recent service logs contained no warnings.
+
+## Not run here: Windows / physical acceptance gates
+
+The following checks require the Windows collector and real Muse hardware:
+
 - SSH tunnel recovery remains healthy.
 - Muse reconnect remains healthy.
 - Network reconnect remains healthy.
