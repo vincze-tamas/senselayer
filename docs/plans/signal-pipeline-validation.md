@@ -1,337 +1,369 @@
-# SenseLayer – Signal Pipeline Validation
+# SenseLayer – kétfázisú Signal Pipeline Validation terv
 
-**Státusz:** implementáció előtti validációs terv  
-**Dátum:** 2026-08-30  
-**Auditált repository:** `vincze-tamas/senselayer`  
-**Auditált commit:** `1fd3a5cca99491b857b5dd0633a1700a982cccd7`  
-**Döntési cél:** eldönteni, hogy a Muse 2-ből számított frekvenciasávok elég megbízhatók-e személyes baseline építéséhez.
+**Státusz:** review-ra kész, implementáció még nem engedélyezett  
+**Dátum:** 2026-09-01  
+**Repository:** `vincze-tamas/senselayer`  
+**Kiinduló commit:** `1fd3a5cca99491b857b5dd0633a1700a982cccd7`  
+**Előző review:** `CHANGES_REQUIRED` – a stratégiai irány elfogadva, a production szerződések és acceptance részletei hiányosak voltak.
 
-## 1. Vezetői döntés
+## 1. Döntés
 
-A Milestone 3 – személyes baseline és normalizált metrikák – **még ne induljon el**. Előtte egy külön, szűk **Signal Pipeline Validation** mérföldkő szükséges.
+A személyes baseline Milestone 3 előtt validálni kell az EEG feature pipeline-t. Ezt azonban **nem production infrastruktúra építésével kezdjük**.
 
-Ennek oka nem az, hogy a baseline iránya hibás, hanem hogy a jelenlegi feature pipeline még nem választja szét kellő biztonsággal:
+A munka két, külön engedélyezendő fázisra bomlik:
 
-- a valódi alacsony frekvenciás EEG-aktivitást;
-- a lassú elektróda-/kontakt-sodródást;
-- a pislogás és szemmozgás homloki hatását;
-- az izomeredetű zajt;
-- az adatkapcsolati hiányokat.
+1. **Fázis A – lokális offline bizonyítás:** rövid raw Muse corpus, replay, szintetikus scorer, DSP bake-off és held-out fizikai acceptance. Nincs VPS-upload, új receiver API, production adatbázis-migráció vagy dashboard-cutover.
+2. **Fázis B – production integráció:** csak sikeres Fázis A után készül végrehajtható terv a clock contractra, v2 feature sémára, raw lifecycle-ra, shadow rolloutra és rollbackre.
 
-Hibás feature-ökre épített baseline a zajt is stabil személyes mintává alakíthatná. Ettől a rendszer konzisztensnek látszana, de nem válna megbízhatóbbá.
+Ez a szétválasztás megőrzi a tudományos szigort, de nem építünk termék-infrastruktúrát egy még ki nem választott algoritmus köré.
 
-## 2. Bizonyított jelenlegi állapot
+## 2. Miért szükséges a Fázis A?
 
-### 2.1. Band power számítás
+A jelenlegi collector:
 
-A `scripts/muse2_edge_collector.py` jelenleg:
+- 2 másodperces ablakból egyetlen periodogramot számol;
+- csak átlaglevonást és Hann-ablakot használ;
+- a négy csatorna sávenergiájának mediánját egyetlen értékké vonja össze;
+- az öt sávot 1-re normalizálja;
+- nem ismer külön slow-drift, pislogás- vagy szemmozgás-flaget;
+- eldobja az LSL timestampet;
+- raw EEG-t nem tárol.
 
-1. 2 másodpercnyi, 256 Hz-es, négycsatornás ablakot használ;
-2. csatornánként átlagot von le;
-3. Hann-ablakot alkalmaz;
-4. egyetlen `rFFT` periodogramot számol;
-5. a csatornák sávenergiájának mediánját veszi;
-6. az öt sávot úgy normalizálja, hogy összegük 1 legyen.
+Ezért a magas delta lehet valódi alacsony frekvenciás aktivitás, de lehet drift vagy okuláris műtermék is. Baseline csak akkor építhető, ha ezek a hatások reprodukálhatóan elkülöníthetők.
 
-Ezért például a `delta=0.8` nem abszolút delta-amplitúdót jelent, hanem azt, hogy az algoritmus által figyelembe vett 0,5–45 Hz-es összenergia 80%-át a delta tartományba sorolta.
-
-### 2.2. Fő technikai vakfoltok
-
-- A 2 másodperces egyetlen periodogram instabil becslés, különösen a delta tartományban.
-- Nincs kontrollált high-pass szűrés vagy lineáris detrending a lassú sodródás ellen.
-- A minőségmodell nem tartalmaz külön lassú-drift, pislogás- vagy szemmozgás-detektort.
-- A négy csatorna mediánja egyetlen globális értékké mossa össze a homloki és temporális eltéréseket.
-- Az LSL timestampet a collector eldobja, így nem ellenőrzi a tényleges mintavételi időzítést és a mintakimaradást.
-- A rossz minőségű feature-ök eltárolhatók és megjelennek a history grafikonon.
-- A Streamlit grafikon a hosszú adatkimaradást egyenes vonallal köti össze.
-- Raw EEG nincs eltárolva, ezért a korábbi mérés új algoritmussal nem dolgozható fel újra.
-
-### 2.3. Ami már jó alap
-
-- A quality pipeline determinisztikus és külön modulban van.
-- A feature-ek 0–1 tartományú szerződése és receiver-validációja létezik.
-- A session, event marker, export és verziózott release-folyamat jó alapot ad a kontrollált protokollhoz.
-- A valós Muse kontaktvesztés/helyreállás acceptance teszt már bizonyította az adatút működését.
-
-## 3. A mérföldkő határai
+## 3. Fázis A – scope és biztonsági korlát
 
 ### Benne van
 
-- rövid, sessionhöz kötött raw EEG rögzítés és determinisztikus replay;
-- időzítés- és gap-validáció;
-- több előfeldolgozási/PSD-konfiguráció összehasonlítása;
-- csatornánkénti abszolút és relatív sávfeature-ök;
-- artefaktumok detektálása és feature-gating;
-- quality-aware history megjelenítés;
-- szintetikus és valós Muse acceptance protokoll;
-- algoritmusverzió és konfigurációs provenance.
+- új, különálló lokális validációs capture eszköz;
+- lokális raw adatbázis és manifest;
+- szintetikus és valós raw replay;
+- több preprocessing/PSD jelölt összehasonlítása;
+- artefaktum-gating prototípus;
+- development és külön held-out valós Muse mérés;
+- automatikus összehasonlító riport;
+- baseline GO/NO-GO döntés.
 
 ### Nincs benne
 
-- személyes baseline létrehozása;
-- Focus/Relaxation pontszám újratervezése;
-- neurofeedback;
-- diagnosztikai, stressz- vagy érzelemállítás;
-- ICA vagy artefaktum „javítása”;
-- folyamatos, korlátlan raw EEG archiválás;
-- teljes Windows tray alkalmazás.
+- a production collector, receiver, SQLite history vagy dashboard működésének megváltoztatása;
+- raw upload a VPS-re;
+- v2 receiver/storage schema;
+- Focus/Relaxation vagy neurofeedback;
+- folyamatos raw archiválás;
+- production cutover vagy deployment.
 
-## 4. Célarchitektúra
+**Fail-safe:** a Fázis A új eszközei nem írhatják a production `history.db`-t, nem POSTolhatnak a receivernek, és nem módosíthatják a futó Windows scheduled taskot.
 
-```mermaid
-flowchart TD
-    A["Muse 2 / LSL"] --> B["Raw session capture"]
-    B --> C["Replayable preprocessing"]
-    C --> D["Quality és artifact flags"]
-    C --> E["Csatornánkénti Welch PSD"]
-    D --> F{"Elfogadható ablak?"}
-    E --> F
-    F -->|Igen| G["Verziózott band feature"]
-    F -->|Nem| H["Tárolt, de maszkolt ablak"]
-    G --> I["Dashboard és későbbi baseline"]
+## 4. Fázis A – rögzített technikai szerződések
+
+### 4.1. Lokális raw formátum
+
+A validációs corpus első formátuma **külön SQLite adatbázis WAL módban**. Ez nem production raw-formátum-döntés.
+
+Indok:
+
+- Python standard library; nincs `pyarrow` függőség;
+- append és tranzakció támogatás;
+- crash után olvasható marad;
+- rövid, 5–10 perces corpushoz elegendő;
+- sample és marker ugyanazon lokális adatbázisban atomikusan köthető a capture UUID-hoz.
+
+Táblák:
+
+```text
+captures(capture_id, created_at, protocol_version, source_name,
+         declared_sample_rate, channel_order_json, software_commit,
+         dependency_snapshot_json, status, notes)
+
+segments(segment_id, capture_id, sequence_no, started_edge_wall,
+         started_edge_monotonic_ns, lsl_time_correction, reconnect_reason)
+
+raw_samples(capture_id, segment_id, sample_index, lsl_timestamp,
+            edge_wall_timestamp, edge_monotonic_ns,
+            tp9_uv, af7_uv, af8_uv, tp10_uv)
+
+markers(capture_id, segment_id, marker_id, label,
+        edge_wall_timestamp, edge_monotonic_ns, notes)
 ```
 
-Alapelv: **a raw adat megmarad a validációs sessionhöz, a feature újraszámítható, a rossz ablak nem tűnik el, de nem jelenhet meg megbízható agyi jelként.**
+Követelmények:
 
-## 5. Végrehajtási terv
+- explicit TP9/AF7/AF8/TP10 csatornasorrend;
+- `float64` nyers érték;
+- capture lezárásakor SHA-256 checksum és manifest;
+- félbeszakadt capture `interrupted`, nem `completed` státuszt kap;
+- a fájl alapértelmezetten helyi marad és kézzel törölhető.
 
-### Kártya 1 – Raw capture és replay contract
+### 4.2. Időalap
 
-**Cél:** ugyanazt a rövid Muse-felvételt több algoritmusváltozattal, azonos eredménnyel lehessen újrafuttatni.
+A Fázis A minden mintát és markert ugyanazon Windows edge gépen rögzít.
 
-**Tervezett tartalom:**
+- `lsl_timestamp`: stream-idő és gap-elemzés;
+- `edge_monotonic_ns`: marker–minta illesztés elsődleges időalapja;
+- `edge_wall_timestamp`: emberileg olvasható idő;
+- `lsl_time_correction`: rögzített diagnosztikai mező;
+- minden reconnect új `segment_id`;
+- segmenthatáron átívelő ablak automatikusan invalid;
+- reconnect és filter-reset után konfigurált warm-up idő invalid.
 
-- Sessionhöz kötött, opt-in raw capture, alapértelmezetten kikapcsolva.
-- Tárolt mezők:
-  - LSL timestamp;
-  - fogadási timestamp;
-  - TP9, AF7, AF8, TP10 raw érték;
-  - deklarált és becsült sample rate;
-  - eszköz-/forrásazonosító;
-  - collector commit és pipeline verzió;
-  - csatornasorrend;
-  - mérési protokoll és event markerek.
-- Rövid sessionökhöz tömörített `NPZ` vagy Parquet spike; a formátumról mért méret és replay-egyszerűség alapján kell dönteni.
-- Fix fixture-fájl a regressziós tesztekhez, személyes tartalom nélküli szintetikus adatokkal.
-- Retention: csak névvel mentett validációs session; nincs automatikus egész napos raw naplózás.
+VPS-óra és szerveroldali marker ebben a fázisban nem vesz részt.
 
-**Elfogadási kritérium:**
+### 4.3. Ablak-szerződés
 
-- Ugyanaz a raw fixture két replay során `1e-9` abszolút tolerancián belül azonos feature-sort eredményez.
-- A replay nem függ a faliórától, hálózattól vagy élő Muse kapcsolattól.
-- Hiányzó/cserélt csatorna vagy hibás timestamp esetén fail-closed eredmény születik.
-- A raw fájl manifestje önmagában azonosítja a feature pipeline verzióját és paramétereit.
+- A feature timestampje az elemzési ablak **vége**.
+- Az ablak nem nyúlhat át segment- vagy protocol-block határon.
+- Átlógás esetén az ablak `boundary_guard` miatt invalid.
+- Live és replay ugyanazt a tiszta processing függvényt használja.
+- A replay chunkolása nem változtathatja a window boundaries, flag-ek vagy validity eredményét.
 
-### Kártya 2 – Időzítés és adatfolyam integritás
+### 4.4. Determinizmus és tolerancia
 
-**Cél:** a spektrális számítás csak valóban folytonos, megfelelően mintavételezett ablakon fusson.
+Az előző `1e-9` globális abszolút tolerancia törölve.
 
-**Tervezett tartalom:**
+Követelmény:
 
-- Az LSL timestamp megőrzése.
-- Effektív sample rate, jitter és gap számítása rolling ablakon.
-- Ablak érvénytelenítése, ha:
-  - a gap meghaladja a várható mintaköz többszörösét;
-  - túl kevés minta érkezik;
-  - a csatornaszám vagy sorrend hibás;
-  - a sample rate tartósan eltér a konfigurációtól.
-- A history grafikonon `NaN`/szegmenshatár beillesztése adatkimaradásnál.
+- azonos manifest, dependency snapshot és window boundaries;
+- flag-ek, validity és sávbesorolás pontos egyezése;
+- relatív power: `rtol=1e-7`, `atol=1e-9` azonos platformon;
+- abszolút PSD: `rtol=1e-6`, skálafüggő `atol`;
+- külön Windows/Linux cross-platform riport;
+- byteazonosság csak a kanonikus JSON/CSV serializationnél követelhető.
 
-**Elfogadási kritérium:**
+## 5. Előre rögzített validációs adatkészletek
 
-- Egy mesterséges 10 másodperces gap nem jelenik meg összekötő vonalként.
-- Gapet tartalmazó ablakból nem keletkezik `valid=true` feature.
-- A dashboard külön jelzi az `acquisition_gap` és a `bad_signal` állapotot.
+### 5.1. Szintetikus development fixture
 
-### Kártya 3 – PSD/preprocessing bake-off
+Legalább:
 
-**Cél:** ugyanazon raw felvételeken kiválasztani a legstabilabb, valós idejű használatra alkalmas pipeline-t.
+- tiszta 2, 6, 10, 20 és 35 Hz jel;
+- két vagy három sávból álló kevert spektrum;
+- alacsony SNR + broadband noise;
+- sávhatár-közeli frekvenciák;
+- alpha + lineáris és polinomiális drift;
+- alpha + blink tranziens;
+- beta + muscle burst;
+- 50 Hz hálózati komponens;
+- amplitude scaling;
+- gap, flatline, abrupt step és channel outlier.
 
-**Összehasonlítandó konfigurációk:**
+A fixture generátora seedelt, paraméterezett és verziózott.
 
-- Jelenlegi 2 s periodogram – kontrollváltozat.
-- Rolling 8 s elemzési ablak, Welch PSD:
-  - 4 s szegmens;
-  - 50% átfedés;
-  - Hann-ablak;
-  - medián periodogram-átlagolás;
-  - 1 másodperces frissítés.
-- High-pass összevetés:
-  - 0,5 Hz;
-  - 1,0 Hz.
-- Detrending összevetés:
-  - constant;
-  - linear.
-- A paramétereket konfigurációként és verziózott hashként kell tárolni.
+### 5.2. Valós development corpus
 
-**Fontos döntés:** az 1 Hz high-pass nem fogadható el automatikusan, mert a névleges 0,5–4 Hz delta egy részét eltávolítja. Ha ez nyer, a megjelenített sávot őszintén `1–4 Hz low-frequency power` néven kell kezelni, nem klasszikus teljes delta-sávként.
+Egy felhelyezéssel, egy napon:
 
-**50 Hz kezelés:** Magyarországon releváns a hálózati zaj, de a jelenlegi feature-sávok 45 Hz-nél véget érnek. Először külön 48–52 Hz line-noise arányt kell mérni. Notch csak akkor kerüljön a production pipeline-ba, ha a raw corpus bizonyítja a szükségességét; ne legyen reflexszerű alapértelmezés.
+- 3 × 60 s nyitott szem, fix pont;
+- 3 × 60 s csukott szem;
+- 30 s normál pislogás;
+- 30 s vezényelt pislogás;
+- 30 s állkapocsfeszítés;
+- 20 s fejpántérintés;
+- 20 s egy elektróda meglazítása;
+- 30 s helyreállás.
 
-**Kimenetek:**
+Ez használható paraméterválasztásra, de nem végső acceptance-re.
 
-- csatornánkénti abszolút PSD-alapú band power, dokumentált egységgel;
-- csatornánkénti relatív band power;
-- opcionális összesített érték, de az eredeti csatornaértékek megtartásával;
-- `window_valid`, `quality_coverage`, `artifact_flags`, `pipeline_version`.
+### 5.3. Held-out acceptance corpus
 
-**Elfogadási kritérium – szintetikus:**
+Másik napon vagy legalább új felhelyezéssel, ugyanazon előre rögzített protokollal készül. A DSP- és detector-paraméterek a capture megkezdése előtt freeze-eltek. A held-out eredmény után tuning csak új verzióval és új acceptance capture-rel lehetséges.
 
-- 10 Hz tiszta jel esetén az alpha a domináns sáv minden csatornán.
-- 6 Hz jel theta-, 20 Hz jel beta-, 35 Hz jel gamma-dominanciát ad.
-- Alpha + lassú polinomiális drift fixture esetén a kiválasztott pipeline az alpha-csúcsot megtartja, miközben a drift nem okoz delta-dominanciát.
-- Az amplitúdó kétszerezése az abszolút teljesítményt közel négyszerezi, a relatív sáveloszlást érdemben nem változtatja meg.
-- Az eredmények végesek, nem negatívak, és a relatív sávok csatornánként 1-re összegződnek.
+## 6. DSP bake-off
 
-**Elfogadási kritérium – stabilitás:**
+### 6.1. Jelöltek
 
-- Ugyanazon nyugodt blokk egymást követő ablakainak varianciája alacsonyabb a jelenlegi periodograménál.
-- A kiválasztást mérőszám és összehasonlító riport dönti el, nem vizuális benyomás.
+**Kontroll:** jelenlegi 2 s periodogram.
 
-### Kártya 4 – Artefaktum-detektálás és feature-gating
+**Welch-jelöltek:**
 
-**Cél:** ne próbáljuk „megjavítani” a négycsatornás jelet; a gyanús ablakot jelöljük és zárjuk ki az értelmezésből.
+- rolling 8 s elemzési ablak;
+- 4 s szegmens;
+- 50% overlap;
+- Hann window;
+- median averaging;
+- 1 s feature-frissítés.
 
-**Új/finomított flag-ek:**
+Összehasonlítandó preprocessing:
+
+- high-pass: 0,5 Hz és 1,0 Hz;
+- detrend: constant és linear;
+- 50 Hz notch: csak külön jelölt, nem automatikus alapértelmezés.
+
+Ha az 1 Hz high-pass nyer, a 0,5–1 Hz tartomány nem nevezhető teljes delta mérésnek; az output elnevezését ehhez kell igazítani.
+
+### 6.2. Scorer – előre rögzített metrikák
+
+| Metrika | Számítás | Szerep |
+|---|---|---|
+| Frequency accuracy | ismert domináns sáv helyes felismerése | hard gate |
+| Boundary leakage | szomszédos sávba jutó energia | rangsorolás |
+| Drift leakage | drift hozzáadása utáni delta-infláció | hard gate |
+| Amplitude scaling error | 2× amplitúdó → 4× abszolút power eltérése | hard gate |
+| Clean CV | nem átfedő clean epochok coefficient of variation értéke | rangsorolás |
+| Artifact sensitivity | helyesen rejectált címkézett artifact epochok | hard gate |
+| Clean specificity | helyesen megtartott clean epochok | hard gate |
+| Transition latency | állapotváltás és stabil feature közti idő | rangsorolás |
+| Valid coverage | clean blokkok valid aránya | hard gate |
+| Runtime | CPU-idő, memória, real-time factor | hard gate |
+| Warm-up loss | reset után elvesző idő | rangsorolás |
+
+### 6.3. Hard gate küszöbök
+
+Ezek a Fázis A előzetes mérnöki küszöbei; Hermes review során csak indokolt módosítással változhatnak, még implementáció előtt.
+
+- középsávos tiszta/kevert fixture domináns sáv felismerése: 100%;
+- amplitude scaling relatív hiba: legfeljebb 10%;
+- drift fixture esetén a cél-sáv dominanciája megmarad, delta növekedése legfeljebb 0,15 relatív power;
+- held-out artifact sensitivity: legalább 0,80;
+- held-out clean specificity: legalább 0,80;
+- held-out clean valid coverage: legalább 0,70;
+- real-time factor: legfeljebb 0,25 a cél Windows gépen;
+- reconnect vagy gapet átfedő ablak: 0% téves validálás.
+
+Az értékeléshez **nem átfedő epochokat** kell használni. Osztályonként legalább 20 értékelhető epoch szükséges; az eredmény confusion matrixszal és elemszámmal jelenik meg.
+
+### 6.4. Győztes kiválasztása
+
+1. Bármely hard gate bukása kizárás.
+2. A túlélő jelöltek Pareto-összehasonlítása: drift leakage, clean CV, transition latency, runtime, warm-up loss.
+3. Holtversenyben az egyszerűbb, kevesebb késleltetésű konfiguráció nyer.
+4. A held-out corpus nem használható kiválasztásra; csak a freeze-elt győztes elfogadására vagy elutasítására.
+
+## 7. Artefaktum-gating prototípus
+
+Fázis A-ban detektálunk és elutasítunk, nem „javítunk”.
+
+Flag-ek:
 
 - `slow_drift`;
 - `blink_or_eye_movement`;
 - `muscle_activity`;
 - `line_noise_50hz`;
-- meglévő contact/amplitude/step/outlier flag-ek;
-- `acquisition_gap` külön adatfolyam-hibaként.
+- meglévő `flatline`, `extreme_amplitude`, `abrupt_steps`, `high_frequency_noise`, `channel_outlier`;
+- `acquisition_gap`, `boundary_guard`, `filter_warmup`.
 
-**Detektálási elv:**
+Korlát: külön EOG/EMG nélkül a blink és muscle heurisztikus címke. A confusion matrix a **protokoll szerint kiváltott eseményt** méri, nem klinikai ground truth-t.
 
-- pislogás/szemmozgás: homloki AF7/AF8 nagy, alacsony frekvenciás tranziens és csatornaközi mintázat;
-- izom: emelkedett magasfrekvenciás arány és rövid, szabálytalan burst;
-- slow drift: túlzott nagyon alacsony frekvenciás trend/slope;
-- line noise: 48–52 Hz energia aránya megfelelő szomszédos referencia-sávhoz képest.
+## 8. Végrehajtható kártyabontás – Fázis A
 
-**Korlát:** négy csatornával, külön EOG/EMG referencia nélkül a flag-ek valószínűségi mérnöki heurisztikák. A production rendszer ezért reject/gate logikát használjon, ne artefaktum-korrekciót és ne diagnosztikai nyelvet.
+### A0 – Contract és executable acceptance
 
-**Gating szerződés:**
+**Fájlok:**
 
-- A feature kiszámítható és eltárolható auditcélra.
-- `bad` vagy elégtelen coverage esetén `window_valid=false`.
-- Érvénytelen ablak nem kerül baseline-ba, trendátlagba, Focus/Relaxation számításba vagy folytonos vonalként a grafikonra.
+- `docs/plans/signal-pipeline-validation.md` – jelen terv;
+- `docs/ROADMAP.md` – plan-only validation gate Milestone 2 és 3 közé;
+- `README.md` – link és státusz;
+- `CHANGELOG.md` – `Unreleased`, plan only.
 
-**Elfogadási kritérium:**
+**Eredmény:** scope, clock, raw schema, scorer, held-out szabály és hard gate freeze-elt.
 
-- A szintetikus blink, drift és muscle fixture determinisztikusan a megfelelő flag-et adja.
-- A tiszta alpha fixture egyik új artifact flag-et sem aktiválja.
-- A dashboardon a rossz ablak látható minőségi maszkként, de nem agyi sávtrendként.
+### A1 – Szintetikus fixture és scorer
 
-### Kártya 5 – Kontrollált valós Muse protokoll
+**Tervezett fájlok:** `validation/fixtures.py`, `validation/scorer.py`, `validation/contracts.py`, `tests/test_validation_fixtures.py`, `tests/test_validation_scorer.py`.
 
-**Cél:** laborállítás nélkül, reprodukálható módon ellenőrizni, hogy a rendszer az ismert állapotváltásokat és a szándékos műtermékeket megkülönbözteti.
+**Parancs:** `python -m pytest tests/test_validation_fixtures.py tests/test_validation_scorer.py -q`
 
-**Egy mérési futam:**
+**Eredmény:** DSP implementáció nélkül futó, reprodukálható acceptance harness.
 
-1. 20 s nyugalmi beállás, nyitott szem, fix pont.
-2. 60 s nyitott szem, mozdulatlan ülés.
-3. 60 s csukott szem, mozdulatlan ülés.
-4. A 2–3. blokk ismétlése még kétszer.
-5. 30 s szándékos pislogás körülbelül 2 másodpercenként.
-6. 30 s kontrollált állkapocsfeszítés, előre rögzített markerekkel.
-7. 20 s fejpántérintés vagy egy elektróda rövid meglazítása.
-8. 30 s helyreállási blokk.
+### A2 – Bounded lokális capture és minimális protocol runner
 
-Teljes idő: körülbelül 9 perc. Minden blokk automatikus event markert kap.
+**Tervezett fájlok:** `scripts/capture_validation_raw.py`, `validation/raw_store.py`, `validation/protocol.py`, `tests/test_validation_raw_store.py`, `tests/test_validation_protocol.py`.
 
-**Valós mérési acceptance:**
+**Parancs:** `python -m pytest tests/test_validation_raw_store.py tests/test_validation_protocol.py -q`
 
-- A tiszta nyitott/csukott blokkok legalább 80%-a valid ablak.
-- A szándékos artefaktum-blokkok elutasítási aránya legalább 50 százalékponttal magasabb a tiszta blokkokénál.
-- A pislogásos blokkban a `blink_or_eye_movement`, az állkapocsblokkban a `muscle_activity`, a kontaktbontásnál a contact/outlier flag dominál.
-- A temporális TP9/TP10 alpha abszolút vagy relatív teljesítménye a csukott szemű blokkban a három párosításból legalább kettőben magasabb a közvetlenül szomszédos nyitott szemű blokknál.
-- Nincs univerzális előírás arra, hogy a delta mindig a legalacsonyabb sáv legyen; a clean block deltaeredményét a raw jel, a flag-ek és a kiválasztott filter-konfiguráció együtt magyarázza.
-- A teljes session raw adata és minden feature-verzió visszajátszható.
+**Eredmény:** lokális SQLite capture, automatikus block/marker vezérlés, checksum és manifest. Nincs production adatút.
 
-Az eyes-open/eyes-closed alpha különbség fiziológiai sanity check, nem diagnózis és nem önmagában elégséges bizonyíték minden sáv validitására.
+### A3 – Replay és timestamp/gap integritás
 
-### Kártya 6 – Dashboard és provenance
+**Tervezett fájlok:** `validation/replay.py`, `validation/timing.py`, `tests/test_validation_replay.py`, `tests/test_validation_timing.py`.
 
-**Cél:** minden grafikonból kiderüljön, mit, milyen minőségből és milyen algoritmussal mutat.
+**Parancs:** `python -m pytest tests/test_validation_replay.py tests/test_validation_timing.py -q`
 
-**Kötelező megjelenítés:**
+**Eredmény:** fix window boundaries, segment/gap/boundary/warm-up gating és determinisztikus replay.
 
-- raw relative és absolute/log-PSD mód egyértelmű megnevezése;
-- csatornánkénti nézet, legalább frontal vs temporal bontással;
-- quality overlay és rejected-window maszk;
-- valódi vonalszakadás adatgapnél vagy érvénytelen ablaknál;
-- pipeline verzió/config hash;
-- valid coverage százalék;
-- session és event marker timeline.
+### A4 – DSP-jelöltek és bake-off
 
-**Elfogadási kritérium:**
+**Tervezett fájlok:** `validation/dsp_candidates.py`, `validation/bakeoff.py`, `requirements-validation.txt`, `tests/test_validation_dsp.py`, `tests/test_validation_bakeoff.py`.
 
-- Egy screenshot alapján megállapítható a forrás, csatorna/aggregáció, időtartomány, normalizáció, quality coverage és pipeline-verzió.
-- Két eltérő pipeline-verzió eredménye nem keverhető egyetlen címkézetlen trendbe.
+**Parancs:** `python -m pytest tests/test_validation_dsp.py tests/test_validation_bakeoff.py -q`
 
-## 6. Go / No-Go kapu a baseline előtt
+**Eredmény:** géppel olvasható és Markdown összehasonlító riport, kizárt jelöltek indoklásával.
 
-### GO – indulhat a Milestone 3, ha mind teljesül
+### A5 – Artefaktum-gating prototípus
 
-- Raw capture és determinisztikus replay működik.
-- A szintetikus frekvencia- és drift-fixture tesztek átmennek.
-- A valós protokoll clean/artifact elkülönítése teljesíti az acceptance feltételeket.
-- A nyitott/csukott szem alpha sanity check reprodukálható.
-- A dashboard nem rajzol át gapet vagy rossz minőségű ablakot.
-- Minden feature rendelkezik pipeline-verzióval és quality státusszal.
-- A teljes regressziós tesztcsomag és a valós Muse acceptance átmegy.
+**Tervezett fájlok:** `validation/artifacts.py`, `tests/test_validation_artifacts.py`.
 
-### NO-GO – nem indulhat baseline, ha bármelyik fennáll
+**Parancs:** `python -m pytest tests/test_validation_artifacts.py -q`
 
-- Ugyanazon raw adat replaye eltérő feature-öket ad.
-- A drift továbbra is rendszeresen delta-dominanciát hoz létre clean jelként.
-- A pislogás/izom/contact műtermék bekerül valid trendbe.
-- Az eyes-open/closed protokoll eredménye nem ismételhető meg.
-- A feature nem köthető egyértelmű algoritmusverzióhoz.
+**Eredmény:** development corpuson freeze-elt detektor és dokumentált thresholdok.
 
-No-go esetén nem további dashboard-fejlesztés következik, hanem a hibás acceptance pont célzott diagnózisa.
+### A6 – Held-out valós Muse acceptance
 
-## 7. Javasolt delivery-sorrend
+**Tervezett output:** `validation_reports/<capture-id>/manifest.json`, `report.md`, confusion matrix, per-channel táblák, kontroll-vs-győztes összehasonlítás és GO/NO-GO jegyzőkönyv.
 
-1. Raw capture/replay contract.
-2. Timestamp és gap integritás.
-3. PSD/preprocessing bake-off offline replayen.
-4. Artifact detector és gating.
-5. Quality-aware dashboard.
-6. Szintetikus acceptance.
-7. Valós Muse protokoll.
-8. Go/no-go döntés a baseline-ról.
+**Eredmény:** a held-out corpus egyszer fut le a freeze-elt konfiguráción. Bukás esetén nincs baseline és nincs production integráció.
 
-Minden kártya külön kis commit, TDD, spec review és code review. A jelenlegi history adatbázist nem szabad törölni vagy újraépíteni; a sémabővítés idempotens migrációval történjen.
+## 9. Fázis A Definition of Done
 
-## 8. Implementációs technológiai javaslat
+- új kód csak `validation/`, dedikált script és tesztterületen;
+- production collector/receiver/storage/dashboard diffje nulla;
+- minden célzott és teljes regressziós teszt átmegy;
+- secret scan és diff review átmegy;
+- development és held-out corpus külön capture ID;
+- hard gate-ek géppel ellenőrzöttek;
+- riport tartalmazza a dependency snapshotot és commit SHA-t;
+- baseline GO/NO-GO döntés dokumentált;
+- nincs deployment vagy production cutover.
 
-- Production edge DSP: `scipy.signal`; az MNE runtime függőségként ehhez túl nagy lenne.
-- Offline ellenőrzéshez MNE használható referenciaként, de ne legyen szükséges az élő collectorhoz.
-- Welch: `scipy.signal.welch`, kezdetben `average="median"`, dokumentált ablak- és overlap-paraméterekkel.
-- Filter: stabil SOS reprezentáció; online módban állapottartó, causal megoldás vagy dokumentált késleltetés. Offline `filtfilt` eredményt nem szabad észrevétlenül azonosnak tekinteni az élő causal pipeline-nal.
-- A kiválasztott production és replay út ugyanazt a tiszta processing modult használja; ne legyen két külön implementáció.
+## 10. Fázis B – csak GO után tervezhető
 
-## 9. Ellenőrzési bizonyítékok
+A Fázis B jelenleg **nem implementációs scope**. GO esetén külön terv kötelező legalább ezekkel:
 
-A mérföldkő lezárásakor kötelező deliverable:
+- raw capture control plane és bounded artifact lifecycle;
+- LSL/edge/server clock-domain contract;
+- v1 backward compatibility és pontos v2 JSON schema;
+- per-channel absolute/relative feature storage külön verziózott táblában;
+- idempotens migráció és rollback utáni olvashatóság;
+- v1/v2 shadow számítás ugyanazon ablakon;
+- pipeline version/config hash;
+- quality-gated dashboard és gapszakítás;
+- offline buffer/upload retry/checksum;
+- cutover flag, edge rollback és adatbázis-backup;
+- külön production Muse acceptance.
 
-- paraméter-összehasonlító riport ugyanazon raw corpuson;
-- kiválasztási döntés és elvetett alternatívák indoklása;
-- szintetikus fixture-eredmények;
-- valós protokoll coverage/flag/band táblája;
-- előtte–utána grafikon a jelenlegi delta-problémáról;
-- repo commit SHA, edge package checksum és telepített pipeline checksum;
-- rollback leírás.
+Fázis B végén, sikeres shadow rollout után indulhat a személyes medián/MAD baseline.
 
-## 10. Források és módszertani támpontok
+## 11. GO / NO-GO
 
-- [SciPy `signal.welch` dokumentáció](https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.welch.html) – szegmentált, átfedő PSD-becslés és medián átlagolás.
-- [MNE – filtering and resampling](https://mne.tools/stable/auto_tutorials/preprocessing/30_filtering_resampling.html) – EEG-előfeldolgozás és a filterezés hatásai.
-- [MNE – artifact detection overview](https://mne.tools/stable/auto_tutorials/preprocessing/10_preprocessing_overview.html) – artefaktumok felismerésének módszertani kerete.
-- [Cannard és mtsai – MUSE spectral validation](https://www.biorxiv.org/content/10.1101/2021.11.02.466989.full) – Muse spektrális használhatóságának összehasonlító vizsgálata.
-- [Krigolson és mtsai – Choosing MUSE](https://www.frontiersin.org/journals/neuroscience/articles/10.3389/fnins.2017.00109/full) – a hordható Muse kutatási validációjának korlátai és lehetőségei.
+### GO a production integráció tervezésére
 
-## 11. Mélykutatási döntés
+- minden Fázis A hard gate teljesül;
+- a held-out eyes-closed blokkokban a TP9/TP10 alpha a három párosításból legalább kettőben magasabb a szomszédos eyes-open blokknál;
+- a freeze-elt győztes a jelenlegi kontrollnál kisebb drift leakage-et ad elfogadható latency mellett;
+- nincs timestamp-, gap- vagy segment-integritási bizonytalanság;
+- az eredmény második replay során reprodukálható.
 
-Ehhez a következő fejlesztési lépéshez teljes deep research **nem szükséges**. A döntő bizonyítékot nem további általános EEG-irodalom, hanem a saját Muse 2 raw corpuson végzett, reprodukálható pipeline-összehasonlítás adja. Célzott szakirodalmi ellenőrzés akkor indokolt, amikor a bake-off eredménye alapján véglegesítjük a filter-, artifact- és baseline-paramétereket.
+### NO-GO
+
+- drift továbbra is clean delta-dominanciát okoz;
+- artifact és clean epochok nem különíthetők el a hard gate szerint;
+- a held-out eredmény tuning nélkül nem ismétli a development eredményt;
+- replay/live windowing vagy timestamp illesztés eltér;
+- a Muse 2 négy csatornája a kívánt use case-hez nem ad stabil feature-t.
+
+NO-GO esetén nem épül production v2 és baseline. A riportnak ki kell mondania, hogy algoritmus-, protokoll- vagy eszközkorlát okozta-e a bukást.
+
+## 12. Mélykutatási döntés
+
+Most nem teljes deep research a következő lépés. A döntő bizonyíték a saját Muse 2 development és held-out raw corpuson futó, előre rögzített scorer. Célzott szakirodalmi ellenőrzés a hard gate-ek és a végleges production DSP-konfiguráció freeze-elése előtt szükséges.
+
+## 13. Hermes következő review-jának kérdései
+
+Hermes ne implementáljon. A review kizárólag ezt döntse el:
+
+1. A Fázis A valóban leválik-e teljesen a production adatútról?
+2. A lokális SQLite raw contract és edge-időalap végrehajtható-e a jelenlegi Windows/MuseLSL környezetben?
+3. A scorer metrikái és hard gate-jei előre rögzítettek és nem túlilleszthetők-e?
+4. A development/held-out szétválasztás megfelelő-e?
+5. Az A0–A6 fájl-, teszt- és parancsszintű bontás kódolható-e további architekturális döntés nélkül?
+6. Maradt-e blocker a Fázis A implementációjának engedélyezése előtt?
